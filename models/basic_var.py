@@ -3,9 +3,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from functools import partial
 from models.helpers import DropPath, drop_path
-
+from typing import Optional, Tuple, Union
 
 # this file only provides the 3 blocks used in VAR transformer
 __all__ = ['FFN', 'AdaLNSelfAttn', 'AdaLNBeforeHead']
@@ -163,12 +163,18 @@ class AdaLNSelfAttn(nn.Module):
 
 
 class AdaLNBeforeHead(nn.Module):
-    def __init__(self, C, D, norm_layer):   # C: embed_dim, D: cond_dim
+    def __init__(self, C, D, act: bool, norm_layer: partial, fused_norm_func=None):   # C: embed_dim, D: cond_dim
         super().__init__()
         self.C, self.D = C, D
         self.ln_wo_grad = norm_layer(C, elementwise_affine=False)
-        self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), nn.Linear(D, 2*C))
+        self.fused_norm_func = fused_norm_func
+        self.norm_eps = norm_layer.keywords.get('eps', 1e-6)
+        lin = nn.Linear(D, 2*C)
+        self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin) if act else nn.Sequential(lin)
     
-    def forward(self, x_BLC: torch.Tensor, cond_BD: torch.Tensor):
+    def forward(self, x_BLC: torch.Tensor, cond_BD: Optional[torch.Tensor]):
         scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
-        return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
+        if self.fused_norm_func is None:
+            return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
+        else:
+            return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
