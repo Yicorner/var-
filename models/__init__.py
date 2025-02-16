@@ -46,16 +46,10 @@ def build_vae_srvar(# Shared args
     
         
     srvar_wo_ddp: SRVAR = SRVAR(**srvar_kw)
-    # TODO：Neesky use_fsdp_model_ema 记得添加到args里
-    if args.use_fsdp_model_ema:
-        # srvar_wo_ddp_ema = get_ema_model(srvar_wo_ddp)
-        raise NotImplementedError('ema not supported')
-    else:
-        srvar_wo_ddp_ema = None
         
     srvar_wo_ddp = srvar_wo_ddp.to(device)
 
     assert all(not p.requires_grad for p in vae_local.parameters())
     assert all(p.requires_grad for n, p in srvar_wo_ddp.named_parameters())
     
-    return vae_local, srvar_wo_ddp, srvar_wo_ddp_ema
+    return vae_local, srvar_wo_ddp

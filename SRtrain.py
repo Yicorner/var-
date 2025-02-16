@@ -8,6 +8,8 @@ from functools import partial
 
 import torch
 from torch.utils.data import DataLoader
+# TODO:Neesky 如果使用flex_attention
+# torch._dynamo.config.optimize_ddp=False
 
 import dist
 from utils import arg_util, misc
@@ -40,7 +42,7 @@ def build_everything(args: arg_util.Args):
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         dataset_train, dataset_val = build_dataset(
-            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+            args.data_path,  hflip=args.hflip,
         )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
@@ -82,7 +84,7 @@ def build_everything(args: arg_util.Args):
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
     
-    vae_local, srvar_wo_ddp, srvar_wo_ddp_ema = build_vae_srvar(
+    vae_local, srvar_wo_ddp = build_vae_srvar(
         args,
         device = dist.get_device(),
         patch_nums=args.patch_nums,   # 10 steps by default
@@ -98,39 +100,8 @@ def build_everything(args: arg_util.Args):
     srvar_wo_ddp.init_weights(other_std=args.tini)
     srvar_wo_ddp.special_init(aln_init=args.aln, aln_gamma_init=args.alng, scale_head=args.hd0, scale_proj=args.diva)
 
-    if args.rush_resume: #应该不走这个分支
-        print(f"{args.rush_resume=}")
-        cpu_d = torch.load(args.rush_resume, 'cpu')
-        if 'trainer' in cpu_d:
-            state_dict = cpu_d['trainer']['srvar_fsdp']
-            ema_state_dict = cpu_d['trainer'].get('srvar_ema_fsdp', state_dict)
-        else:
-            state_dict = cpu_d
-            ema_state_dict = state_dict
-        def drop_unfit_weights(state_dict):
-            if 'word_embed.weight' in state_dict and (state_dict['word_embed.weight'].shape[1] != srvar_wo_ddp.word_embed.in_features):
-                del state_dict['word_embed.weight']
-            if 'head.weight' in state_dict and (state_dict['head.weight'].shape[0] != srvar_wo_ddp.head.out_features):
-                del state_dict['head.weight']
-            if 'head.bias' in state_dict and (state_dict['head.bias'].shape[0] != srvar_wo_ddp.head.bias.shape[0]):
-                del state_dict['head.bias']
-            if state_dict['text_proj_for_sos.ca.mat_kv.weight'].shape != srvar_wo_ddp.text_proj_for_sos.ca.mat_kv.weight.shape:
-                del state_dict['cfg_uncond']
-                for key in list(state_dict.keys()):
-                    if 'text' in key:
-                        del state_dict[key]
-            return state_dict
-        
-        srvar_wo_ddp.load_state_dict(drop_unfit_weights(state_dict), strict=False)
-        if args.use_fsdp_model_ema:
-            srvar_wo_ddp.load_state_dict(drop_unfit_weights(ema_state_dict), strict=False)
             
-    if args.rwe: #应该不走这个分支
-        srvar_wo_ddp.word_embed.weight.requires_grad = False
-        torch.nn.init.trunc_normal_(srvar_wo_ddp.word_embed.weight.data, std=1.5 * math.sqrt(1 / srvar_wo_ddp.C / 3))
-        if hasattr(srvar_wo_ddp.word_embed, 'bias'):
-            srvar_wo_ddp.word_embed.bias.requires_grad = False
-            srvar_wo_ddp.word_embed.bias.data.zero_()
+
     ndim_dict = {name: para.ndim for name, para in srvar_wo_ddp.named_parameters() if para.requires_grad}
     
     print(f'[PT] srvar model = {srvar_wo_ddp}\n\n')

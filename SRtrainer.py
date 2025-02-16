@@ -212,7 +212,7 @@ class SRVARTrainer(object):
     
     def state_dict(self):
         state = {'config': self.get_config()}
-        for k in ('var_wo_ddp', 'vae_local', 'var_opt'):
+        for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
             m = getattr(self, k)
             if m is not None:
                 if hasattr(m, '_orig_mod'):

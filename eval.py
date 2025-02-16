@@ -94,7 +94,7 @@ srvar.load_state_dict(torch.load(ckpt_path_srvar, map_location='cpu')['trainer']
 
 # %%
 dataset_train, dataset_val = build_dataset(
-    args.data_path, final_reso=256, hflip=args.hflip, mid_reso=1.25,
+    args.data_path, hflip=args.hflip, 
 )
 types = str((type(dataset_train).__name__, type(dataset_val).__name__))
 

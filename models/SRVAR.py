@@ -471,8 +471,7 @@ class SRVAR(nn.Module):
         returns_vemb=0, 
         top_k = 0,
         top_p = 0.0, 
-        
-        vae_type=0,                 # 0应该是指的是原始VAE，其他是bit的VAE
+
         ret_img=False,              # 是否返回图片
         trunk_scale=1000,           # 控制图片最大的大小，大于这个不生成了
         gt_leak=0, gt_ls_Bl=None,   # 看不懂，不知道干嘛。暂且保持不动
@@ -593,12 +592,8 @@ class SRVAR(nn.Module):
 
         if not ret_img:
             return ret, idx_Bl_list, []
-        
-        if vae_type != 0:
-            img = vae.decode(summed_codes.squeeze(-3))
-        else:
-            img = vae.fhat_to_img(accu_BChw)
 
+        img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
         print(img.max(), img.min() ,img.shape)
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
@@ -879,7 +874,7 @@ if __name__ == "__main__":
         label_B_or_BLT=label_B_or_BLT, 
         scale_schedule=scale_schedule,
         cfg_list=[1.0]*len(scale_schedule),tau_list=[1.0]*len(scale_schedule),
-        vae_type=0, ret_img = True,
+        ret_img = True,
         top_k=1,top_p=1.0,
         inference_mode=True
     )

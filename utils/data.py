@@ -48,17 +48,12 @@ def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
 
 def build_dataset(
     data_path: str, final_reso: int,
-    hflip=False, mid_reso=1.125,
+    hflip=False, 
 ):
     # build augmentations
-    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
     train_aug, val_aug = [
-        # transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), # transforms.Resize: resize the shorter edge to mid_reso
-        # transforms.RandomCrop((final_reso, final_reso)),
         transforms.ToTensor(), normalize_01_into_pm1,
     ], [
-        # transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), # transforms.Resize: resize the shorter edge to mid_reso
-        # transforms.CenterCrop((final_reso, final_reso)),
         transforms.ToTensor(), normalize_01_into_pm1,
     ]
     if hflip: train_aug.insert(0, transforms.RandomHorizontalFlip())

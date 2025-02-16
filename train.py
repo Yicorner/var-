@@ -40,7 +40,7 @@ def build_everything(args: arg_util.Args):
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         num_classes, dataset_train, dataset_val = build_dataset(
-            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+            args.data_path, hflip=args.hflip,
         )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
@@ -141,7 +141,7 @@ def build_everything(args: arg_util.Args):
         rng = torch.Generator('cpu')
         rng.manual_seed(0)
         B = 4
-        inp = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
+        inp = torch.rand(B, 3, 256,256)
         label = torch.ones(B, dtype=torch.long)
         
         me = misc.MetricLogger(delimiter='  ')
