@@ -14,7 +14,7 @@ def build_vae_srvar(# Shared args
 ) -> Tuple[VQVAE, SRVAR]:
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi, v_patch_nums=patch_nums).to(device)
     
-    gpt_kw = dict(
+    srvar_kw = dict(
         low_channel=args.Ct5, low_len=args.tlen,
         norm_eps=args.norm_eps, rms_norm=args.rms,
         shared_aln=args.saln, head_aln=args.haln,
@@ -38,23 +38,24 @@ def build_vae_srvar(# Shared args
         block_chunks = args.block_chunks,
 
     )
-    if args.dp >= 0: gpt_kw['drop_path_rate'] = args.dp
-    if args.hd > 0: gpt_kw['num_heads'] = args.hd
+    if args.dp >= 0: srvar_kw['drop_path_rate'] = args.dp
+    if args.hd > 0: srvar_kw['num_heads'] = args.hd
     
-    print(f'[create gpt_wo_ddp] constructor kw={gpt_kw}\n')
-    gpt_kw['vae_local'] = vae_local
+    print(f'[create srvar_wo_ddp] constructor kw={srvar_kw}\n')
+    srvar_kw['vae_local'] = vae_local
     
-    gpt_wo_ddp: SRVAR = SRVAR(**gpt_kw)
+        
+    srvar_wo_ddp: SRVAR = SRVAR(**srvar_kw)
     # TODO：Neesky use_fsdp_model_ema 记得添加到args里
     if args.use_fsdp_model_ema:
-        # gpt_wo_ddp_ema = get_ema_model(gpt_wo_ddp)
+        # srvar_wo_ddp_ema = get_ema_model(srvar_wo_ddp)
         raise NotImplementedError('ema not supported')
     else:
-        gpt_wo_ddp_ema = None
+        srvar_wo_ddp_ema = None
         
-    gpt_wo_ddp = gpt_wo_ddp.to(device)
+    srvar_wo_ddp = srvar_wo_ddp.to(device)
 
     assert all(not p.requires_grad for p in vae_local.parameters())
-    assert all(p.requires_grad for n, p in gpt_wo_ddp.named_parameters())
+    assert all(p.requires_grad for n, p in srvar_wo_ddp.named_parameters())
     
-    return vae_local, gpt_wo_ddp, gpt_wo_ddp_ema
+    return vae_local, srvar_wo_ddp, srvar_wo_ddp_ema

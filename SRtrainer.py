@@ -52,37 +52,60 @@ class SRVARTrainer(object):
         self.last_prog_si = -1
         self.first_prog = True
     
-    # @torch.no_grad()
-    # def eval_ep(self, ld_val: DataLoader):
-    #     tot = 0
-    #     L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
-    #     stt = time.time()
-    #     training = self.var_wo_ddp.training
-    #     self.var_wo_ddp.eval()
-    #     for inp_B3HW, label_B in ld_val:
-    #         B, V = label_B.shape[0], self.vae_local.vocab_size
-    #         inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-    #         label_B = label_B.to(dist.get_device(), non_blocking=True)
+    @torch.no_grad()
+    def eval_ep(self, ld_val: DataLoader):
+        tot = 0
+        L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
+        stt = time.time()
+        training = self.srvar_wo_ddp.training
+        self.srvar_wo_ddp.eval()
+        for inp_B3HW_low, inp_B3HW_super in ld_val:
+            B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
+            inp_B3HW_low = inp_B3HW_low.to(dist.get_device(), non_blocking=True)
+            inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
             
-    #         gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-    #         gt_BL = torch.cat(gt_idx_Bl, dim=1)
-    #         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            # forward
+            B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
+            gt_idx_Bl_low: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_low)
+            gt_BL_low = torch.cat(gt_idx_Bl_low, dim=1)
+            x_BLCv_wo_first_l_low = self.quantize_local.embedding(gt_BL_low)  #这里应该是gt的idx组成的embedding
             
-    #         self.var_wo_ddp.forward
-    #         logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
-    #         L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-    #         L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
-    #         acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-    #         acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
-    #         tot += B
-    #     self.var_wo_ddp.train(training)
+            gt_idx_Bl_super: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_super)
+            gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
+            x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
+            
+            # [3,679,32]
+            lowLen, lowC = x_BLCv_wo_first_l_low.shape[1], x_BLCv_wo_first_l_low.shape[2]
+            
+            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device)  # 每个句子的 token 长度
+            
+            max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_super.device)  # 5
+            cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_super.device).to(dtype = torch.int32)
+            label_B_or_BLT = (x_BLCv_wo_first_l_low, lens, cu_seqlens_k, max_seqlen_k)
+            
+            
+            h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
+            T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
+            h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
+            h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
+            scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
+            scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
+            
+            self.srvar_wo_ddp.forward
+            logits_BLV = self.srvar_wo_ddp(label_B_or_BLT, x_BLCv_wo_first_l_super, scale_schedule)
+            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)) * B
+            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)) * B
+            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL_super).sum() * (100/gt_BL_super.shape[1])
+            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL_super[:, -self.last_l:]).sum() * (100 / self.last_l)
+            tot += B
+        self.srvar_wo_ddp.train(training)
         
-    #     stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
-    #     dist.allreduce(stats)
-    #     tot = round(stats[-1].item())
-    #     stats /= tot
-    #     L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
-    #     return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
+        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
+        dist.allreduce(stats)
+        tot = round(stats[-1].item())
+        stats /= tot
+        L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
+        return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
     
     def train_step(
         self, ep:int, it: int, g_it: int, stepping: bool,  clip_decay_ratio: float,metric_lg: MetricLogger, tb_lg: TensorboardLogger,
@@ -101,30 +124,24 @@ class SRVARTrainer(object):
         if self.first_prog: prog_wp = 1    # no prog warmup at first prog stage, as it's already solved in wp
         if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
         
+        self.srvar.require_backward_grad_sync = stepping
+        
         # forward
         B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
         gt_idx_Bl_low: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_low)
         gt_BL_low = torch.cat(gt_idx_Bl_low, dim=1)
-        x_BLCv_wo_first_l_low: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_low)
-        
+        x_BLCv_wo_first_l_low = self.quantize_local.embedding(gt_BL_low)  #这里应该是gt的idx组成的embedding
+   
         gt_idx_Bl_super: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_super)
         gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
         x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
         # [3,679,32]
         lowLen, lowC = x_BLCv_wo_first_l_low.shape[1], x_BLCv_wo_first_l_low.shape[2]
         
-        self.srvar.require_backward_grad_sync = stepping
-        
         lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device)  # 每个句子的 token 长度
-        
         max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_super.device)  # 5
         cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_super.device).to(dtype = torch.int32)
         label_B_or_BLT = (x_BLCv_wo_first_l_low, lens, cu_seqlens_k, max_seqlen_k)
-        
-        gt_idx_Bl_super: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_super)
-        gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
-        x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
-        
         
         h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
         T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
@@ -204,7 +221,7 @@ class SRVARTrainer(object):
         return state
     
     def load_state_dict(self, state, strict=True, skip_vae=False):
-        for k in ('var_wo_ddp', 'vae_local', 'var_opt'):
+        for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
             if skip_vae and 'vae' in k: continue
             m = getattr(self, k)
             if m is not None:

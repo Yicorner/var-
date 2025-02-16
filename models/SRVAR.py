@@ -32,7 +32,7 @@ class TextAttentivePool(nn.Module):
     def __init__(self, Ct5: int, D: int):
         super().__init__()
         self.Ct5, self.D = Ct5, D
-        self.head_dim = 16
+        self.head_dim = 8
         # if D > 4096:
         #     self.head_dim = 64 
         # else:
@@ -632,50 +632,6 @@ class SRVAR(nn.Module):
         # [3. unpad the seqlen dim, and then get logits]
         return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size    
         
-                
-    # def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
-    #     """
-    #     :param label_B: label_B
-    #     :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
-    #     :return: logits BLV, V is vocab_size
-    #     """
-    #     bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
-    #     B = x_BLCv_wo_first_l.shape[0]
-    #     with torch.cuda.amp.autocast(enabled=False):
-    #         label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-    #         sos = cond_BD = self.class_emb(label_B)
-    #         sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
-            
-    #         if self.prog_si == 0: x_BLC = sos
-    #         else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-    #         x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
-        
-    #     attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-    #     cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-        
-    #     # hack: get the dtype if mixed precision is used
-    #     temp = x_BLC.new_ones(8, 8)
-    #     main_type = torch.matmul(temp, temp).dtype
-        
-    #     x_BLC = x_BLC.to(dtype=main_type)
-    #     cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
-    #     attn_bias = attn_bias.to(dtype=main_type)
-        
-    #     AdaLNSelfAttn.forward
-    #     for i, b in enumerate(self.blocks):
-    #         x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-    #     x_BLC = self.get_logits(x_BLC.float(), cond_BD)
-        
-    #     if self.prog_si == 0:
-    #         if isinstance(self.word_embed, nn.Linear):
-    #             x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
-    #         else:
-    #             s = 0
-    #             for p in self.word_embed.parameters():
-    #                 if p.requires_grad:
-    #                     s += p.view(-1)[0] * 0
-    #             x_BLC[0, 0, 0] += s
-    #     return x_BLC    # logits BLV, V is vocab_size
     def load_state_dict(self, state_dict: Dict[str, Any], strict=False, assign=False):
         for k in state_dict:
             if 'cfg_uncond' in k:
@@ -831,8 +787,19 @@ if __name__ == "__main__":
     # raw_scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     # scale_schedule = [(1,h,h) for h in raw_scale_schedule]
     
-    logits = var(label_B_or_BLT, x_BLCv_wo_first_l, scale_schedule)
-    print(logits.shape)
-    logits.mean().backward()
-
+    # logits = var(label_B_or_BLT, x_BLCv_wo_first_l, scale_schedule)
+    # print(logits.shape)
+    # logits.mean().backward()
+    _,_,image_list = var.autoregressive_infer_cfg(
+        B = 3,
+        vae=vqvae,
+        label_B_or_BLT=label_B_or_BLT, 
+        scale_schedule=scale_schedule,
+        cfg_list=[1.0]*len(scale_schedule),tau_list=[1.0]*len(scale_schedule),
+        vae_type=0, ret_img = True,
+        top_k=1,top_p=1.0,
+        inference_mode=True
+    )
+    from PIL import Image
+    Image.fromarray(image_list[0].detach().cpu().numpy()).save("test.png")
     

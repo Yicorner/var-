@@ -89,8 +89,8 @@ def build_everything(args: arg_util.Args):
     # VQVAE args
         V=args.vocab_size, Cvae=args.Ct5, ch=160, share_quant_resi=4,
         )
-    # TODO:Neesky 这里需要取消注释
-    # vae_local.load_state_dict(torch.load(args.vae_ckpt, map_location='cpu'), strict=True)
+
+    vae_local.load_state_dict(torch.load(args.vae_ckpt, map_location='cpu')["trainer"]["vae_wo_ddp"], strict=True)
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     
     if args.tini < 0:
@@ -102,8 +102,8 @@ def build_everything(args: arg_util.Args):
         print(f"{args.rush_resume=}")
         cpu_d = torch.load(args.rush_resume, 'cpu')
         if 'trainer' in cpu_d:
-            state_dict = cpu_d['trainer']['gpt_fsdp']
-            ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
+            state_dict = cpu_d['trainer']['srvar_fsdp']
+            ema_state_dict = cpu_d['trainer'].get('srvar_ema_fsdp', state_dict)
         else:
             state_dict = cpu_d
             ema_state_dict = state_dict
@@ -133,13 +133,13 @@ def build_everything(args: arg_util.Args):
             srvar_wo_ddp.word_embed.bias.data.zero_()
     ndim_dict = {name: para.ndim for name, para in srvar_wo_ddp.named_parameters() if para.requires_grad}
     
-    print(f'[PT] GPT model = {srvar_wo_ddp}\n\n')
+    print(f'[PT] srvar model = {srvar_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters()) / 1e6:.2f}'
     print(f'[PT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (
         ('VAE', vae_local), ('VAE.quant', vae_local.quantize)
     )]))
     print(f'[PT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (
-        ('GPT', srvar_wo_ddp),
+        ('srvar', srvar_wo_ddp),
     )]) + '\n\n')
     
     srvar_wo_ddp = args.compile_model(srvar_wo_ddp, args.tfast)
