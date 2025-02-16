@@ -454,72 +454,155 @@ class SRVAR(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             return self.head(self.head_nm(h.float(), cond_BD.float()))
     
-    
-    # @torch.no_grad()
-    # def autoregressive_infer_cfg(
-    #     self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-    #     g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-    #     more_smooth=False,
-    # ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
-    #     """
-    #     only used for inference, on autoregressive mode
-    #     :param B: batch size
-    #     :param label_B: imagenet label; if None, randomly sampled
-    #     :param g_seed: random seed
-    #     :param cfg: classifier-free guidance ratio
-    #     :param top_k: top-k sampling
-    #     :param top_p: top-p sampling
-    #     :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-    #     :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
-    #     """
-    #     if g_seed is None: rng = None
-    #     else: self.rng.manual_seed(g_seed); rng = self.rng
+
+    @torch.no_grad()
+    def autoregressive_infer_cfg(
+        self,
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT=None,
+        B=1, 
+        g_seed=None, 
         
-    #     if label_B is None:
-    #         label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-    #     elif isinstance(label_B, int):
-    #         label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
+        cfg_list=[], tau_list=[],   # 全1.0*len(scale_schedule)
+        negative_label_B_or_BLT=None, #可以先不管， 做条件生成的（非条件生成的BLT）
+        cfg_insertion_layer=[-5],   # 可以先不管，  做条件生成的（如何添加条件生成的信息到logits）
         
-    #     sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        returns_vemb=0, 
+        top_k = 0,
+        top_p = 0.0, 
         
-    #     lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-    #     next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        vae_type=0,                 # 0应该是指的是原始VAE，其他是bit的VAE
+        ret_img=False,              # 是否返回图片
+        trunk_scale=1000,           # 控制图片最大的大小，大于这个不生成了
+        gt_leak=0, gt_ls_Bl=None,   # 看不懂，不知道干嘛。暂且保持不动
+        inference_mode=False,
+    ):   # returns List[idx_Bl]
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
+        assert len(cfg_list) >= len(scale_schedule)
+        assert len(tau_list) >= len(scale_schedule)
         
-    #     cur_L = 0
-    #     f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        
-    #     for b in self.blocks: b.attn.kv_caching(True)
-    #     for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-    #         ratio = si / self.num_stages_minus_1
-    #         # last_L = cur_L
-    #         cur_L += pn*pn
-    #         # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-    #         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-    #         x = next_token_map
-    #         AdaLNSelfAttn.forward
-    #         for b in self.blocks:
-    #             x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-    #         logits_BlV = self.get_logits(x, cond_BD)
+        kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+
+        bs = B
             
-    #         t = cfg * ratio
-    #         logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
-    #         idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-    #         if not more_smooth: # this is the default case
-    #             h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-    #         else:   # not used when evaluating FID/IS/Precision/Recall
-    #             gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-    #             h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
-    #         h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-    #         f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-    #         if si != self.num_stages_minus_1:   # prepare for next stage
-    #             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-    #             next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-    #             next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+        kv_compact = self.low_norm(kv_compact)
+        sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
         
-    #     for b in self.blocks: b.attn.kv_caching(False)
-    #     return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        kv_compact = self.low_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
+        ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+
+        with torch.amp.autocast('cuda', enabled=False):
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+        accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
+        idx_Bl_list, idx_Bld_list = [], []
+
+        accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
+        
+        if inference_mode:
+            for b in self.unregistered_blocks: 
+                (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+        
+        abs_cfg_insertion_layers = []
+        add_cfg_on_logits, add_cfg_on_probs = False, False
+        leng = len(self.unregistered_blocks)
+        for item in cfg_insertion_layer:
+            if item == 0: # add cfg on logits
+                add_cfg_on_logits = True
+            elif item == 1: # add cfg on probs
+                add_cfg_on_probs = True # todo in the future, we may want to add cfg on logits and probs
+            elif item < 0: # determine to add cfg at item-th layer's output
+                assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
+                abs_cfg_insertion_layers.append(leng+item)
+            else:
+                raise ValueError(f'cfg_insertion_layer: {item} is not valid')
+        
+        num_stages_minus_1 = len(scale_schedule)-1
+
+        for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            
+            cfg = cfg_list[si]
+            if si >= trunk_scale:
+                break
+            cur_L += np.array(pn).prod()
+
+            need_to_pad = 0
+            attn_fn = None
+            if self.use_flex_attn:
+                # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
+                # if need_to_pad:
+                #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
+                attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            layer_idx = 0
+            
+            for block_idx, b in enumerate(self.block_chunks):
+                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
+                if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                if not self.add_lvl_embeding_only_first_block: 
+                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                    
+                for m in b.module:
+                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+
+            if (cfg != 1) and add_cfg_on_logits:
+                # print(f'add cfg on add_cfg_on_logits')
+                logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
+                logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+            else:
+                logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+
+            # idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+
+            # _ ,idx_Bl = torch.max(logits_BlV, dim=-1)
+            idx_Bl = logits_BlV.data.argmax(dim=-1)
+
+            h_BChw = vae.quantize.embedding(idx_Bl).float()   # BlC
+            # if si == 1:
+            #     print(idx_Bl[0])
+            # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+            ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
+            idx_Bl_list.append(idx_Bl)
+            
+            
+            accu_BChw, last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), accu_BChw, h_BChw)
+            
+            if si != num_stages_minus_1:
+                last_stage = last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
+                last_stage = self.word_embed(self.norm0_ve(last_stage))
+                last_stage = last_stage.repeat(bs//B, 1, 1)
+                
+                
+        if inference_mode:
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+
+        if not ret_img:
+            return ret, idx_Bl_list, []
+        
+        if vae_type != 0:
+            img = vae.decode(summed_codes.squeeze(-3))
+        else:
+            img = vae.fhat_to_img(accu_BChw)
+
+        img = (img + 1) / 2
+        print(img.max(), img.min() ,img.shape)
+        img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+        return ret, idx_Bl_list, img
     
     def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
         bs, seq_len, c = feature.shape
