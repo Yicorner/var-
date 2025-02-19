@@ -18,6 +18,12 @@ from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 import math
 
+from torch.nn.parallel import DistributedDataParallel as DDP
+from models import SRVAR, VQVAE, build_vae_srvar
+from SRtrainer import SRVARTrainer
+from utils.amp_sc import AmpOptimizer
+from utils.lr_control import filter_params
+
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
@@ -77,12 +83,7 @@ def build_everything(args: arg_util.Args):
         iters_train = 10
 
     
-    # build models
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import SRVAR, VQVAE, build_vae_srvar
-    from SRtrainer import SRVARTrainer
-    from utils.amp_sc import AmpOptimizer
-    from utils.lr_control import filter_params
+
     
     vae_local, srvar_wo_ddp = build_vae_srvar(
         args,
@@ -249,11 +250,10 @@ def main_training():
     dist.barrier()
 
 
-def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
+def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer:SRVARTrainer):
     # import heavy packages after Dataloader object creation
-    from trainer import VARTrainer
     from utils.lr_control import lr_wd_annealing
-    trainer: VARTrainer
+
     
     step_cnt = 0
     me = misc.MetricLogger(delimiter='  ')
