@@ -34,6 +34,13 @@ class SRVARTrainer(object):
         del self.srvar_wo_ddp.rng
         self.srvar_wo_ddp.rng = torch.Generator(device=device)
         
+        self.patch_nums, self.resos = patch_nums, resos
+        self.begin_ends = []
+        cur = 0
+        for i, pn in enumerate(patch_nums):
+            self.begin_ends.append((cur, cur + pn * pn))
+            cur += pn*pn
+        
         self.label_smooth = label_smooth
         self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
@@ -41,12 +48,13 @@ class SRVARTrainer(object):
         self.last_l = patch_nums[-1] * patch_nums[-1]
         self.loss_weight = torch.ones(1, self.L, device=device) / self.L
         
-        self.patch_nums, self.resos = patch_nums, resos
-        self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(patch_nums):
-            self.begin_ends.append((cur, cur + pn * pn))
-            cur += pn*pn
+        step = 1.0 / len(patch_nums)
+        are_loss_weight = 1.0
+        for index,(begin,ed) in enumerate(self.begin_ends):
+            print(f"begin:{begin},end:{ed},are_loss_weight:{are_loss_weight}")
+            self.loss_weight[:, begin:ed] *= are_loss_weight
+            are_loss_weight -= step
+            
         
         self.prog_it = 0
         self.last_prog_si = -1
