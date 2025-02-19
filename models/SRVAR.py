@@ -627,8 +627,8 @@ class SRVAR(nn.Module):
         cfg_infer=False,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
-        if cfg_infer:
-            return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
+        # if cfg_infer:
+        #     return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -640,10 +640,11 @@ class SRVAR(nn.Module):
                 kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])
             # drop cond
             total = 0
-            for le in lens:
-                if random.random() < self.cond_drop_rate:
-                    kv_compact[total:total+le] = self.cfg_uncond[:le]
-                total += le
+            if not cfg_infer:
+                for le in lens:
+                    if random.random() < self.cond_drop_rate:
+                        kv_compact[total:total+le] = self.cfg_uncond[:le]
+                    total += le
             must_on_graph = self.cfg_uncond[0, 0] * 0
             kv_compact = self.low_norm(kv_compact).contiguous()
             sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32
@@ -653,13 +654,18 @@ class SRVAR(nn.Module):
             
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
         
+            with open('log.txt', 'a') as f:
+                f.write(f'sos:{sos.unsqueeze(1).expand(B, 1, -1)}\n')
+                f.write(f'sos:{self.pos_start.expand(B, 1, -1)}\n')        
             sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
             x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
             
             # [1.1. pad the seqlen dim]
             l_end = x_BLC.shape[1]
             need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end # 0
-            
+                 
+
+                
             if self.use_flex_attn:
                 if need_to_pad:
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
