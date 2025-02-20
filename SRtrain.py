@@ -48,7 +48,7 @@ def build_everything(args: arg_util.Args):
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         dataset_train, dataset_val = build_dataset(
-            args.data_path,  hflip=args.hflip,
+            args.data_path, augment=True
         )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
@@ -205,15 +205,15 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % 1 == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
-            best_updated = best_val_loss_tail > val_loss_tail
+            best_updated = best_val_loss_mean > val_loss_mean
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)
             AR_ep_loss.update(vL_mean=val_loss_mean, vL_tail=val_loss_tail, vacc_mean=val_acc_mean, vacc_tail=val_acc_tail)
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
-            print(f' [*] [ep{ep}]  (val {tot})  Lm: {L_mean:.4f}, Lt: {L_tail:.4f}, Acc m&t: {acc_mean:.2f} {acc_tail:.2f},  Val cost: {cost:.2f}s')
+            print(f' [*] [ep{ep}]  (val {tot})  Lm: {val_loss_mean:.4f}, Lt: {val_loss_tail:.4f}, Acc m&t: {val_acc_mean:.2f} {val_acc_tail:.2f},  Val cost: {cost:.2f}s')
             
             if dist.is_local_master():
                 local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
@@ -227,7 +227,18 @@ def main_training():
                 }, local_out_ckpt)
                 if best_updated:
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
-                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+                    
+                local_out_ckpt = os.path.join(args.local_out_dir_path, f'ckpt-{ep+1}.pth')        
+                #if(ckpt_num % (args.ep // 25) == 0):
+                if((ep+1) % 4 == 0):
+                    torch.save({
+                    'epoch':    ep+1,
+                    'iter':     0,
+                    'trainer':  trainer.state_dict(),
+                    'args':     args.state_dict(),
+                    }, local_out_ckpt)
+                    print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+                    
             dist.barrier()
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
