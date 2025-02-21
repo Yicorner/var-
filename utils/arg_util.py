@@ -28,6 +28,8 @@ class Args(Tap):
     enable_checkpointing: str = None    # checkpointing strategy: full-block, self-attn
     pad_to_multiplier: int = 1          # >1 for padding the seq len to a multiplier of this
     train_h_div_w_list :list = [1.0]
+    val_and_saving_per_ep:int = 5
+    use_are_loss_weight:bool = False
     # VAE
     vocab_size: int = 4096
     vae_ckpt: str = None
@@ -42,7 +44,7 @@ class Args(Tap):
     
     # data
     patch_size: int = 16
-    patch_nums: tuple = (1,2,3,4,5,6,8,10,13,16)    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
+    patch_nums: tuple = (1,3,5,8,12,16)    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
 
     hflip: bool = False         # augmentation: horizontal flip
     

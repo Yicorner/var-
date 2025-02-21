@@ -22,7 +22,7 @@ class SRVARTrainer(object):
     def __init__(
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
         vae_local: VQVAE, srvar_wo_ddp: SRVAR, srvar: DDP,
-        var_opt: AmpOptimizer, label_smooth: float,
+        var_opt: AmpOptimizer, label_smooth: float, use_are_loss_weight: bool = False
     ):
         super(SRVARTrainer, self).__init__()
         
@@ -48,12 +48,13 @@ class SRVARTrainer(object):
         self.last_l = patch_nums[-1] * patch_nums[-1]
         self.loss_weight = torch.ones(1, self.L, device=device) / self.L
         
-        step = 1.0 / len(patch_nums)
-        are_loss_weight = 1.0
-        for index,(begin,ed) in enumerate(self.begin_ends):
-            print(f"begin:{begin},end:{ed},are_loss_weight:{are_loss_weight}")
-            self.loss_weight[:, begin:ed] *= are_loss_weight
-            are_loss_weight -= step
+        if use_are_loss_weight:
+            step = 1.0 / len(patch_nums)
+            are_loss_weight = 1.0
+            for index,(begin,ed) in enumerate(self.begin_ends):
+                print(f"begin:{begin},end:{ed},are_loss_weight:{are_loss_weight}")
+                self.loss_weight[:, begin:ed] *= are_loss_weight
+                are_loss_weight -= step
             
         
         self.prog_it = 0

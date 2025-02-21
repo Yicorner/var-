@@ -135,7 +135,7 @@ vae = vae.eval()
 # %%
 _psnr, _ssim, _mse = [],[],[]
 
-for idx, (inp_B3HW_low, inp_B3HW_super) in tqdm(enumerate(ld_train), total=len(ld_val)):
+for idx, (inp_B3HW_low, inp_B3HW_super) in tqdm(enumerate(ld_val), total=len(ld_val)):
     if(idx>=maxtot and maxtot>0):
         break
     

@@ -24,6 +24,8 @@ from SRtrainer import SRVARTrainer
 from utils.amp_sc import AmpOptimizer
 from utils.lr_control import filter_params
 
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
@@ -155,7 +157,7 @@ def build_everything(args: arg_util.Args):
     trainer = SRVARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
         vae_local=vae_local, srvar_wo_ddp=srvar_wo_ddp, srvar=srvar_ddp,
-        var_opt=srvar_optim, label_smooth=args.ls,
+        var_opt=srvar_optim, label_smooth=args.ls, use_are_loss_weight = args.use_are_loss_weight
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
@@ -205,7 +207,7 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 1 == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % args.val_and_saving_per_ep == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_mean > val_loss_mean
@@ -230,14 +232,14 @@ def main_training():
                     
                 local_out_ckpt = os.path.join(args.local_out_dir_path, f'ckpt-{ep+1}.pth')        
                 #if(ckpt_num % (args.ep // 25) == 0):
-                if((ep+1) % 4 == 0):
-                    torch.save({
-                    'epoch':    ep+1,
-                    'iter':     0,
-                    'trainer':  trainer.state_dict(),
-                    'args':     args.state_dict(),
-                    }, local_out_ckpt)
-                    print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+
+                torch.save({
+                'epoch':    ep+1,
+                'iter':     0,
+                'trainer':  trainer.state_dict(),
+                'args':     args.state_dict(),
+                }, local_out_ckpt)
+                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
                     
             dist.barrier()
         
@@ -282,7 +284,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     for it, (low, super) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
         g_it = ep * iters_train + it
         if it < start_it: continue
-        if is_first_ep and it == start_it: warnings.resetwarnings()
+        # if is_first_ep and it == start_it: warnings.resetwarnings()
         
         low = low.to(args.device, non_blocking=True)
         super = super.to(args.device, non_blocking=True)
