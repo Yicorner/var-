@@ -61,6 +61,8 @@ class VQVAE(nn.Module):
     
     def fhat_to_img(self, f_hat: torch.Tensor):
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
+    def img_to_f(self, inp_img_no_grad: torch.Tensor):
+        return self.quant_conv(self.encoder(inp_img_no_grad))
     
     def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
         f = self.quant_conv(self.encoder(inp_img_no_grad))

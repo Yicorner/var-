@@ -143,21 +143,21 @@ for idx, (inp_B3HW_low, inp_B3HW_super) in tqdm(enumerate(ld_val), total=len(ld_
     inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
     
     B, V = inp_B3HW_low.shape[0], vae.vocab_size
-    gt_idx_Bl_low = vae.img_to_idxBl(inp_B3HW_low)
-    gt_BL_low = torch.cat(gt_idx_Bl_low, dim=1)
-    x_BLCv_wo_first_l_low = vae.quantize.embedding(gt_BL_low)  #这里应该是gt的idx组成的embedding
+    
+    low_f = vae.img_to_f(inp_B3HW_low)
+    low_f = low_f.permute(0, 2, 3, 1)
+    low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+    
+    gt_idx_Bl_super= vae.img_to_idxBl(inp_B3HW_super)
+    gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
+    x_BLCv_wo_first_l_super= vae.quantize.idxBl_to_var_input(gt_idx_Bl_super)
 
-    # [3,679,32]
-    lowLen, lowC = x_BLCv_wo_first_l_low.shape[1], x_BLCv_wo_first_l_low.shape[2]
-    
-    lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_low.device)  # 每个句子的 token 长度
-    
-    x_BLCv_wo_first_l_low = x_BLCv_wo_first_l_low.reshape( -1, lowC)
-    
-    max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_low.device)  # 5
-    cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_low.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_low.device).to(dtype = torch.int32)
-    label_B_or_BLT = (x_BLCv_wo_first_l_low, lens, cu_seqlens_k, max_seqlen_k)
-    
+    lowLen, lowC = low_f.shape[1], low_f.shape[2]
+    lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device)  # 每个句子的 token 长度
+    low_f = low_f.reshape( -1, lowC)
+    max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_super.device)  # 5
+    cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_super.device).to(dtype = torch.int32)
+    label_B_or_BLT = (low_f, lens, cu_seqlens_k, max_seqlen_k)
     
     h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
     T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
