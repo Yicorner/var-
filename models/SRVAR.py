@@ -654,9 +654,9 @@ class SRVAR(nn.Module):
             
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
         
-            with open('log.txt', 'a') as f:
-                f.write(f'sos:{sos.unsqueeze(1).expand(B, 1, -1)}\n')
-                f.write(f'sos:{self.pos_start.expand(B, 1, -1)}\n')        
+            # with open('log.txt', 'a') as f:
+            #     f.write(f'sos:{sos.unsqueeze(1).expand(B, 1, -1)}\n')
+            #     f.write(f'sos:{self.pos_start.expand(B, 1, -1)}\n')        
             sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
             x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
             
@@ -686,7 +686,6 @@ class SRVAR(nn.Module):
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
         else:
             attn_fn = None
-            
         # [2. block loop]
         SelfAttnBlock.forward, CrossAttnBlock.forward
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training

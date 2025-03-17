@@ -94,8 +94,11 @@ def build_everything(args: arg_util.Args):
     # VQVAE args
         V=args.vocab_size, Cvae=args.Ct5, ch=160, share_quant_resi=4,
         )
-
-    vae_local.load_state_dict(torch.load(args.vae_ckpt, map_location='cpu')["trainer"]["vae_wo_ddp"], strict=True)
+    vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
+    if "trainer" in vae_ckpt.keys():
+        vae_ckpt = vae_ckpt["trainer"]["vae_wo_ddp"]    
+    vae_local.load_state_dict(vae_ckpt, strict=True)
+    
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     
     if args.tini < 0:

@@ -44,8 +44,9 @@ class Args(Tap):
     
     # data
     patch_size: int = 16
-    patch_nums: tuple = (1,3,5,8,12,16)    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
-
+    # patch_nums: tuple = (1,3,5,8,12,16)    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
+    patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16) 
+    
     hflip: bool = False         # augmentation: horizontal flip
     
     # progressive training
