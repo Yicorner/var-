@@ -19,3 +19,4 @@ local_output*
 *.txt
 *.jpg
 *.png
+ckpt_save/

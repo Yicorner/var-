@@ -99,6 +99,8 @@ def build_everything(args: arg_util.Args):
         vae_ckpt = vae_ckpt["trainer"]["vae_wo_ddp"]    
     vae_local.load_state_dict(vae_ckpt, strict=True)
     
+    print(f"load from {vae_ckpt}")
+    
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     
     if args.tini < 0:
@@ -164,7 +166,7 @@ def build_everything(args: arg_util.Args):
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
-    
+        print("load var and skip var's vaex!")
     del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim
     
     dist.barrier()
