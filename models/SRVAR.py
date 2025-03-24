@@ -22,6 +22,11 @@ try:
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
+def gather_by_indices(X, Y):
+    # 创建批次索引
+    batch_indices = torch.arange(X.shape[0], device=X.device).view(-1, 1).expand(-1, Y.shape[1])
+    result = X[batch_indices, Y]
+    return result
 
 class MultiInpIdentity(nn.Module):
     def forward(self, x, *args, **kwargs):
@@ -454,6 +459,47 @@ class SRVAR(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             return self.head(self.head_nm(h.float(), cond_BD.float()))
     
+    def get_scale_logits(self,
+                   si,
+                   last_stage,
+                   cond_BD_or_gss,
+                   ca_kv,
+                   cond_BD,
+                   scale_schedule,
+                   B,
+                   need_to_pad,
+                   attn_fn,
+                   cache_now
+                   ):
+
+        for b in self.unregistered_blocks: 
+            (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching_now(cache_now)
+
+        for block_idx, b in enumerate(self.block_chunks):
+            # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
+            if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+            if not self.add_lvl_embeding_only_first_block: 
+                last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                
+            for m in b.module:
+                last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+
+
+        return  self.get_logits(last_stage[:B], cond_BD[:B])
+
+    def idx2next(self, idx_Bl, vae, si, accu_BChw, ret, idx_Bl_list, ):
+        h_BChw = vae.quantize.embedding(idx_Bl).float()   # BlC
+        h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+        
+        ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
+        idx_Bl_list.append(idx_Bl)
+        
+        accu_BChw, last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), accu_BChw, h_BChw)
+        if si != num_stages_minus_1:
+            last_stage = last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
+            last_stage = self.word_embed(self.norm0_ve(last_stage))
+            last_stage = last_stage.repeat(bs//B, 1, 1)
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
@@ -463,24 +509,13 @@ class SRVAR(nn.Module):
         label_B_or_BLT=None,
         B=1, 
         g_seed=None, 
-        
-        cfg_list=[], tau_list=[],   # 全1.0*len(scale_schedule)
-        negative_label_B_or_BLT=None, #可以先不管， 做条件生成的（非条件生成的BLT）
-        cfg_insertion_layer=[-5],   # 可以先不管，  做条件生成的（如何添加条件生成的信息到logits）
-        
         returns_vemb=0, 
-        top_k = 0,
-        top_p = 0.0, 
-
         ret_img=False,              # 是否返回图片
         trunk_scale=1000,           # 控制图片最大的大小，大于这个不生成了
-        gt_leak=0, gt_ls_Bl=None,   # 看不懂，不知道干嘛。暂且保持不动
-        inference_mode=False,
+        beam_search_nums = 3,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
-        assert len(cfg_list) >= len(scale_schedule)
-        assert len(tau_list) >= len(scale_schedule)
         
         kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
 
@@ -496,80 +531,104 @@ class SRVAR(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
-        idx_Bl_list, idx_Bld_list = [], []
+        idx_Bl_list = []
+        
 
         accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
         
-        if inference_mode:
-            for b in self.unregistered_blocks: 
-                (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
-        else:
-            assert self.num_block_chunks > 1
-            for block_chunk_ in self.block_chunks:
-                for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
-        
-        abs_cfg_insertion_layers = []
-        add_cfg_on_logits, add_cfg_on_probs = False, False
-        leng = len(self.unregistered_blocks)
-        for item in cfg_insertion_layer:
-            if item == 0: # add cfg on logits
-                add_cfg_on_logits = True
-            elif item == 1: # add cfg on probs
-                add_cfg_on_probs = True # todo in the future, we may want to add cfg on logits and probs
-            elif item < 0: # determine to add cfg at item-th layer's output
-                assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
-                abs_cfg_insertion_layers.append(leng+item)
-            else:
-                raise ValueError(f'cfg_insertion_layer: {item} is not valid')
         
         num_stages_minus_1 = len(scale_schedule)-1
 
-        for si, pn in enumerate(scale_schedule):   # si: i-th segment
-            
-            cfg = cfg_list[si]
-            if si >= trunk_scale:
-                break
-            cur_L += np.array(pn).prod()
+        need_to_pad = 0
+        attn_fn = None
 
-            need_to_pad = 0
-            attn_fn = None
-            if self.use_flex_attn:
-                # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
-                # if need_to_pad:
-                #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
+        self.use_flex_attn = False
+        if self.use_flex_attn:
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
 
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            layer_idx = 0
+        for b in self.unregistered_blocks: 
+            (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+
+        for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            if si >= trunk_scale:
+                break
+            num_pn = np.array(pn).prod()
+            cur_L += num_pn
+            nex_is = si+1
+
+            logits_BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
+                                                        ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
+                                                        B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
             
-            for block_idx, b in enumerate(self.block_chunks):
-                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
-                if self.add_lvl_embeding_only_first_block and block_idx == 0:
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if not self.add_lvl_embeding_only_first_block: 
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+
+            if num_pn > beam_search_nums and si != num_stages_minus_1:
+
+                probs = F.softmax(logits_BlV, dim=-1)
+                value_Bl, idx_Bl = probs.max(dim=-1)
+                # print("idx_BL:",idx_Bl.shape, value_Bl.shape)
+                min_value_value_Bls,min_idx_value_Bls = value_Bl.topk(beam_search_nums, dim=-1, largest=False)
+                # print("min_Bls:",min_value_value_Bls.shape, min_idx_value_Bls.shape)
+                # print("min_value_value_Bls:",min_value_value_Bls)
+                # print("min_idx_value_Bls:",min_idx_value_Bls)
+
+                # max_value_value_Bls,max_idx_value_Bls = value_Bl.topk(beam_search_nums, dim=-1, largest=True)
+                # print("max_Bls:",max_value_value_Bls.shape, max_idx_value_Bls.shape)
+                # print("max_value_value_Bls:",max_value_value_Bls)
+                # print("max_idx_value_Bls:",max_idx_value_Bls)
+
+                idx_Bl = logits_BlV.data.argmax(dim=-1)
+                beam_find_best_idx_Bl = idx_Bl.clone()
+                beam_find_best_score_Bl = torch.zeros(B,device=accu_BChw.device,dtype=accu_BChw.dtype)
+                for beam_search_idx in  range(2 ** beam_search_nums):
+                    beam_idx_Bl = idx_Bl.clone()
+                    beam_accu_BChw = accu_BChw.clone()
+                    beam_choose_p = torch.ones((B,1),device=accu_BChw.device,dtype=accu_BChw.dtype)
+                    for _search_idx in range(beam_search_nums):
+
+                        pos_idx = min_idx_value_Bls[...,_search_idx].unsqueeze(-1)
+                        # print("pos_idx:",pos_idx,"min_idx_value_Bls",min_idx_value_Bls.shape)
+                        # print("probs:",probs.shape)
+                        batch_indices = torch.arange(probs.shape[0], device=probs.device).view(-1, 1).expand(-1, pos_idx.shape[1])
+                        top2_values, top2_indices = probs[batch_indices,pos_idx].topk(2, dim=-1)
+                        # print("top2_indices:",top2_indices)
+                        # 
+                        if (beam_search_idx & 2**_search_idx) == 0:
+                            beam_choose_p = beam_choose_p + top2_values[...,0]
+                            continue 
+                                               
+                        beam_choose_p = beam_choose_p + top2_values[...,1]
+                        beam_idx_Bl[batch_indices,pos_idx] = top2_indices[...,1]
+                        # print(f"pos_idx:{pos_idx} chooose top2_indices:{top2_indices}")
+
+                    h_BChw = vae.quantize.embedding(beam_idx_Bl).float()   # BlC
+                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+                    beam_accu_BChw, beam_last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), beam_accu_BChw, h_BChw)
+
+                    beam_last_stage = beam_last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
+                    beam_last_stage = self.word_embed(self.norm0_ve(beam_last_stage))
+                    beam_last_stage = beam_last_stage.repeat(bs//B, 1, 1)
                     
-                for m in b.module:
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    
+                    beam_logits_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
+                            ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
+                            B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=False)
 
-            if (cfg != 1) and add_cfg_on_logits:
-                # print(f'add cfg on add_cfg_on_logits')
-                logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
-                logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
-            else:
-                logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
+                    # 不同batch的结果应该不一样
+                    beam_probs = F.softmax(beam_logits_BlV, dim=-1)
+                    beam_value_max_Bl, beam_idx_max_Bl = beam_probs.max(dim=-1)
+                    beam_score = beam_value_max_Bl.sum(dim=-1)
 
-            # idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                    for _b in range(B):
+                        if beam_find_best_score_Bl[_b] < (beam_score[_b] + beam_choose_p[_b]):
+                            beam_find_best_idx_Bl[_b] = beam_idx_Bl[_b] + beam_choose_p[_b]
 
-            # _ ,idx_Bl = torch.max(logits_BlV, dim=-1)
+                idx_Bl = beam_find_best_idx_Bl
+
+
             idx_Bl = logits_BlV.data.argmax(dim=-1)
-
             h_BChw = vae.quantize.embedding(idx_Bl).float()   # BlC
-            # if si == 1:
-            #     print(idx_Bl[0])
-            # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+            
             ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
             idx_Bl_list.append(idx_Bl)
             
@@ -582,20 +641,16 @@ class SRVAR(nn.Module):
                 last_stage = last_stage.repeat(bs//B, 1, 1)
                 
                 
-        if inference_mode:
-            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
-        else:
-            assert self.num_block_chunks > 1
-            for block_chunk_ in self.block_chunks:
-                for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+                
+        for b in self.unregistered_blocks: 
+            (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+
 
         if not ret_img:
             return ret, idx_Bl_list, []
 
         img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
-        print(img.max(), img.min() ,img.shape)
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
         return ret, idx_Bl_list, img
     

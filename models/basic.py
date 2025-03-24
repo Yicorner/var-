@@ -228,9 +228,10 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = get_dropout_layer(proj_drop)
         
-        self.caching = False    # kv caching: only used during inference
-        self.cached_k = None    # kv caching: only used during inference
-        self.cached_v = None    # kv caching: only used during inference
+        self.caching_now = False # kv caching: only used during inference
+        self.caching = False     # kv caching: only used during inference
+        self.cached_k = None     # kv caching: only used during inference
+        self.cached_v = None     # kv caching: only used during inference
 
         self.batch_size = batch_size
         self.use_flex_attn = use_flex_attn
@@ -243,7 +244,9 @@ class SelfAttention(nn.Module):
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
-    
+    def kv_caching_now(self, enable: bool): # kv caching: only used during inference
+        self.caching_now = enable
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
         """
@@ -287,13 +290,18 @@ class SelfAttention(nn.Module):
             q = q.contiguous()      # bf16
             k = k.contiguous()      # bf16
             v = v.contiguous()      # bf16
-        # TODO:Neesky 去掉了旋转embedding
         if rope2d_freqs_grid is not None:
             q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
-            if self.cached_k is None: self.cached_k = k; self.cached_v = v
-            else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
-        
+            if self.cached_k is None: 
+                if self.caching_now: 
+                    self.cached_k = k; self.cached_v = v
+            else:
+                if self.caching_now: 
+                    k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
+                else:
+                    k = torch.cat((self.cached_k, k), dim=L_dim); v = torch.cat((self.cached_v, v), dim=L_dim)
+                
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
