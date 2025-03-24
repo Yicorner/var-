@@ -41,7 +41,13 @@ musiq_iqa_metric = pyiqa.create_metric('musiq', device=device)
 dists_iqa_metric = pyiqa.create_metric('dists', device=device)
 niqe_iqa_metric = pyiqa.create_metric('niqe', device=device)
 
-
+            
+def process_image(x):
+    """处理单张图片"""    
+    x = x.detach().cpu().permute(0, 2, 3, 1).numpy()  # 转换为 HWC 格式的 numpy 数组
+    x = (x * 0.5 + 0.5) * 255  # 反归一化并缩放到 [0, 255]
+    x = x.astype(np.uint8)  # 转换为 uint8
+    return x
 def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
     return x.add(x).add_(-1)
 def setup(rank, world_size):
@@ -171,34 +177,34 @@ def get_img(args, ld_val, maxtot, ckpt_paths):
             scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
             scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
             
+            # idx_predict = []
+            # for si,pn in enumerate(patch_nums):
+            #     idx_predict.append(torch.zeros(B,pn*pn,dtype=torch.int64).to(device=inp_B3HW_low.device))
             
-            idx_predict = []
-            for si,pn in enumerate(patch_nums):
-                idx_predict.append(torch.zeros(B,pn*pn,dtype=torch.int64).to(device=inp_B3HW_low.device))
-            
-            Cul_L = 0
-            for si, pn in enumerate(patch_nums):
-                num_pn = pn*pn
-                temp_BLC = vae.quantize.idxBl_to_var_input(idx_predict)
-                logits_BLV = srvar(label_B_or_BLT, temp_BLC ,scale_schedule,cfg_infer=True)
-                idx_temp = logits_BLV.data.argmax(dim=-1)
+            # Cul_L = 0
+            # for si, pn in enumerate(patch_nums):
+            #     num_pn = pn*pn
+            #     temp_BLC = vae.quantize.idxBl_to_var_input(idx_predict)
+            #     logits_BLV = srvar(label_B_or_BLT, temp_BLC ,scale_schedule,cfg_infer=True)
+            #     idx_temp = logits_BLV.data.argmax(dim=-1)
                 
-                idx_predict[si] = idx_temp[:,Cul_L:Cul_L+num_pn].reshape(B,num_pn)
-                Cul_L = Cul_L + num_pn
+            #     idx_predict[si] = idx_temp[:,Cul_L:Cul_L+num_pn].reshape(B,num_pn)
+            #     Cul_L = Cul_L + num_pn
                 
-            idx_Bl_list = idx_predict
-            idx_predict = torch.cat(idx_predict,dim=1)
+            # idx_Bl_list = idx_predict
+            # idx_predict = torch.cat(idx_predict,dim=1)
             
-            nup_test = vae.idxBl_to_img(idx_Bl_list, same_shape=True, last_one=True)
-            
-            def process_image(x):
-                """处理单张图片"""    
-                x = x.detach().cpu().permute(0, 2, 3, 1).numpy()  # 转换为 HWC 格式的 numpy 数组
-                x = (x * 0.5 + 0.5) * 255  # 反归一化并缩放到 [0, 255]
-                x = x.astype(np.uint8)  # 转换为 uint8
-                return x
+            # nup_test = vae.idxBl_to_img(idx_Bl_list, same_shape=True, last_one=True)
+            # nup_test = process_image(nup_test)
 
-            nup_test = process_image(nup_test)
+            ret, idx_Bl_list, img = srvar.autoregressive_infer_cfg(vae=vae, label_B_or_BLT=label_B_or_BLT, 
+                                scale_schedule=scale_schedule,
+                                ret_img=True,
+                                B=B)
+
+            nup_test = img.detach().cpu().numpy()
+
+
             nup_gt = process_image(inp_B3HW_super)
 
             for i in range(B):
