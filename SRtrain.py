@@ -99,7 +99,7 @@ def build_everything(args: arg_util.Args):
         vae_ckpt = vae_ckpt["trainer"]["vae_wo_ddp"]    
     vae_local.load_state_dict(vae_ckpt, strict=True)
     
-    print(f"load from {vae_ckpt}")
+    print(f"load from {args.vae_ckpt}")
     
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     
