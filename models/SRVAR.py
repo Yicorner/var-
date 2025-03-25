@@ -550,7 +550,9 @@ class SRVAR(nn.Module):
                                                         ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
                                                         B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
             
-            idx_Bl = logits_BlV.data.argmax(dim=-1)
+            # idx_Bl = logits_BlV.data.argmax(dim=-1)
+            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0]
+            
             beam_search_nums_modify= min(beam_search_nums,num_pn)
             if beam_search_nums > 0 and si != num_stages_minus_1:
 
