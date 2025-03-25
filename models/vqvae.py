@@ -61,13 +61,20 @@ class VQVAE(nn.Module):
     
     def fhat_to_img(self, f_hat: torch.Tensor):
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
+    
     def img_to_f(self, inp_img_no_grad: torch.Tensor):
         return self.quant_conv(self.encoder(inp_img_no_grad))
     
-    def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
+    def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None, return_fhat = False) -> List[torch.LongTensor]:    # return List[Bl]
         f = self.quant_conv(self.encoder(inp_img_no_grad))
-        return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
+        if return_fhat:
+            return [self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums), f]
+        else :
+            return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
     
+    def idxBl_to_fhat(self, ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        return self.quantize.idxBl_to_fhat(ms_idx_Bl)
+
     def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], same_shape: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
         B = ms_idx_Bl[0].shape[0]
         ms_h_BChw = []
@@ -95,3 +102,4 @@ class VQVAE(nn.Module):
         if 'quantize.ema_vocab_hit_SV' in state_dict and state_dict['quantize.ema_vocab_hit_SV'].shape[0] != self.quantize.ema_vocab_hit_SV.shape[0]:
             state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
         return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
+    

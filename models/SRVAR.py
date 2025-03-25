@@ -17,6 +17,8 @@ from models.vqvae import VQVAE, VectorQuantizer2
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 from models.basic import CrossAttnBlock,flash_attn_func, FastRMSNorm, SelfAttnBlock, flash_fused_op_installed, CrossAttention, precompute_rope2d_freqs_grid
 
+from models.diffusion.diffloss import DiffLoss
+
 try:
     from models.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
 except:
@@ -314,94 +316,17 @@ class SRVAR(nn.Module):
             end='\n\n', flush=True
         )
         
-        # # 0. hyperparameters
-        # assert embed_dim % num_heads == 0
-        # self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
-        # self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
-        
-        # self.cond_drop_rate = cond_drop_rate
-        # self.prog_si = -1   # progressive training
-        
-        # self.patch_nums: Tuple[int] = patch_nums
-        # self.L = sum(pn ** 2 for pn in self.patch_nums)
-        # self.first_l = self.patch_nums[0] ** 2
-        # self.begin_ends = []
-        # cur = 0
-        # for i, pn in enumerate(self.patch_nums):
-        #     self.begin_ends.append((cur, cur+pn ** 2))
-        #     cur += pn ** 2
-        
-        # self.num_stages_minus_1 = len(self.patch_nums) - 1
-        # self.rng = torch.Generator(device=dist.get_device())
-        
-        # # 1. input (word) embedding
-        # quant: VectorQuantizer2 = vae_local.quantize
-        # self.vae_proxy: Tuple[VQVAE] = (vae_local,)
-        # self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
-        # self.word_embed = nn.Linear(self.Cvae, self.C)
-        
-        # # 2. class embedding
-        # init_std = math.sqrt(1 / self.C / 3)
-        # self.num_classes = num_classes
-        # self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
-        # self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
-        # nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-        # self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
-        # nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
-        
-        # # 3. absolute position embedding
-        # pos_1LC = []
-        # for i, pn in enumerate(self.patch_nums):
-        #     pe = torch.empty(1, pn*pn, self.C)
-        #     nn.init.trunc_normal_(pe, mean=0, std=init_std)
-        #     pos_1LC.append(pe)
-        # pos_1LC = torch.cat(pos_1LC, dim=1)     # 1, L, C
-        # assert tuple(pos_1LC.shape) == (1, self.L, self.C)
-        # self.pos_1LC = nn.Parameter(pos_1LC)
-        # # level embedding (similar to GPT's segment embedding, used to distinguish different levels of token pyramid)
-        # self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
-        # nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
-        
-        # # 4. backbone blocks
-        # self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
-        
-        # norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        # self.drop_path_rate = drop_path_rate
-        # dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
-        # self.blocks = nn.ModuleList([
-        #     AdaLNSelfAttn(
-        #         cond_dim=self.D, shared_aln=shared_aln,
-        #         block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
-        #         drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
-        #         attn_l2_norm=attn_l2_norm,
-        #         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-        #     )
-        #     for block_idx in range(depth)
-        # ])
-        
-        # fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
-        # self.using_fused_add_norm_fn = any(fused_add_norm_fns)
-        # print(
-        #     f'\n[constructor]  ==== flash_if_available={flash_if_available} ({sum(b.attn.using_flash for b in self.blocks)}/{self.depth}), fused_if_available={fused_if_available} (fusing_add_ln={sum(fused_add_norm_fns)}/{self.depth}, fusing_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.blocks)}/{self.depth}) ==== \n'
-        #     f'    [VAR config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}\n'
-        #     f'    [drop ratios ] drop_rate={drop_rate}, attn_drop_rate={attn_drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
-        #     end='\n\n', flush=True
-        # )
-        
-        # # 5. attention mask used in training (for masking out the future)
-        # #    it won't be used in inference, since kv cache is enabled
-        # d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
-        # dT = d.transpose(1, 2)    # dT: 11L
-        # lvl_1L = dT[:, 0].contiguous()
-        # self.register_buffer('lvl_1L', lvl_1L)
-        # attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
-        # self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
-        
-        # # 6. classifier head
-        # self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
-        # self.head = nn.Linear(self.C, self.V)
-        
-        
+        self.diffloss = DiffLoss(
+            in_channels=vae_local.Cvae,
+            img_size=16,
+            num_sampling_steps='10',
+            sampler='iddpm',
+        )
+    
+    def forward_diff_loss(self, z, target, mask=None):
+        loss = self.diffloss(z=z, target=target, mask=mask)
+        return loss
+    
     def compile_flex_attn(self):
         
         attn_fn_compile_dict = {}
@@ -684,6 +609,8 @@ class SRVAR(nn.Module):
         self, label_B_or_BLT: Tuple[torch.FloatTensor, torch.IntTensor, int], 
         x_BLC_wo_prefix: torch.Tensor,
         scale_schedule:List[Tuple[int]],
+        f_hat :torch.Tensor,
+        vae_local :VQVAE,
         cfg_infer=False,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
@@ -771,9 +698,24 @@ class SRVAR(nn.Module):
                     # x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
+        
+        x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD)
+        idx_Bl = x_BLC.argmax(dim=-1)
+        idx_Bl_list = []
+        curL = 0
+        for scale in scale_schedule:
+            curL_next = curL + np.prod(scale)
+            idx_Bl_list.append(idx_Bl[:, curL:curL_next])
+            curL = curL_next
 
+
+        f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
+
+        diff_loss = self.forward_diff_loss(
+            z=f_hat_predict, target=f_hat
+        )
         # [3. unpad the seqlen dim, and then get logits]
-        return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size    
+        return x_BLC, diff_loss    # return logits BLV, V is vocab_size    
         
     def load_state_dict(self, state_dict: Dict[str, Any], strict=False, assign=False):
         for k in state_dict:

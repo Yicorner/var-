@@ -138,7 +138,7 @@ class SRVARTrainer(object):
         low_f = low_f.permute(0, 2, 3, 1)
         low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
 
-        gt_idx_Bl_super: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_super)
+        gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
         gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
         x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
         # [3,679,32]
@@ -158,7 +158,11 @@ class SRVARTrainer(object):
         
         with self.var_opt.amp_ctx:
             self.srvar_wo_ddp.forward
-            logits_BLV = self.srvar(label_B_or_BLT, x_BLCv_wo_first_l_super,scale_schedule)
+            logits_BLV, diff_loss = self.srvar(label_B_or_BLT = label_B_or_BLT, \
+                                               x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
+                                               scale_schedule = scale_schedule, \
+                                               f_hat = f_hat_super, \
+                                               vae_local=self.vae_local)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL_super.view(-1)).view(B, -1)
             if prog_si >= 0:    # in progressive training
                 bg, ed = self.begin_ends[prog_si]
@@ -167,7 +171,7 @@ class SRVARTrainer(object):
                 lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
             else:               # not in progressive training
                 lw = self.loss_weight
-            loss = loss.mul(lw).sum(dim=-1).mean()
+            loss = loss.mul(lw).sum(dim=-1).mean() + diff_loss * 2.0  
         
         # backward
         # grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)

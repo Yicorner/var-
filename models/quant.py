@@ -165,6 +165,26 @@ class VectorQuantizer2(nn.Module):
         
         return f_hat_or_idx_Bl
     
+    # need to check
+    def idxBl_to_fhat(self, ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        
+        B = ms_idx_Bl[0].shape[0]
+        C = self.Cvae
+        H = W = self.v_patch_nums[-1]
+        SN = len(self.v_patch_nums)
+        
+        f_hat = ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
+        for si in range(SN):
+            pn = self.v_patch_nums[si]
+            idx_Bhw = ms_idx_Bl[si]
+            if (si != SN-1):
+                h_BChw = F.interpolate(self.embedding(ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn), size=(H, W), mode='bicubic').contiguous() 
+            else :
+                h_BChw = self.embedding(ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn).contiguous()
+            h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
+            f_hat.add_(h_BChw)
+
+        return f_hat
     # ===================== idxBl_to_var_input: only used in VAR training, for getting teacher-forcing input =====================
     def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
         next_scales = []

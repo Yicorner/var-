@@ -1,8 +1,8 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12346 SRtrain.py  \
---bs=144 --ep=500 \
+export CUDA_VISIBLE_DEVICES=0,1
+torchrun --nproc_per_node=2 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12346 SRtrain.py  \
+--bs=72 --ep=500 \
 --tblr=0.0003 \
---alng=1e-3 --wpe=0.1 --data_path=./data/brats_256_t1_2021_pair_4x \
+--alng=1e-3 --wpe=0.1 --data_path=../data/brats_256_t1_2021_pair_4x \
 --pn="1M" \
 --rope2d_normalized_by_hw=2 --rope2d_each_sa_layer=1 \
 --enable_checkpointing="full-block" \
@@ -20,4 +20,4 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --m
 # --pad_to_multiplier=128 --use_flex_attn=True 
 # fp16 infity是2(bf16) var是1(fp16)
 
-python sendEmail.py
+# python sendEmail.py
