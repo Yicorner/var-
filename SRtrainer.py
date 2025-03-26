@@ -64,7 +64,7 @@ class SRVARTrainer(object):
     @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):
         tot = 0
-        L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
+        L_mean, L_tail, acc_mean, acc_tail, diff_loss_mean = 0, 0, 0, 0, 0
         stt = time.time()
         training = self.srvar_wo_ddp.training
         self.srvar_wo_ddp.eval()
@@ -78,7 +78,7 @@ class SRVARTrainer(object):
             low_f = low_f.permute(0, 2, 3, 1)
             low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
             
-            gt_idx_Bl_super: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW_super)
+            gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
             gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
             x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
             
@@ -98,20 +98,25 @@ class SRVARTrainer(object):
             scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
             
             self.srvar_wo_ddp.forward
-            logits_BLV = self.srvar_wo_ddp(label_B_or_BLT, x_BLCv_wo_first_l_super, scale_schedule)
+            logits_BLV, diff_loss = self.srvar(label_B_or_BLT = label_B_or_BLT, \
+                                    x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
+                                    scale_schedule = scale_schedule, \
+                                    f_hat = f_hat_super, \
+                                    vae_local=self.vae_local)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)) * B
+            diff_loss_mean += diff_loss * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL_super).sum() * (100/gt_BL_super.shape[1])
             acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL_super[:, -self.last_l:]).sum() * (100 / self.last_l)
             tot += B
         self.srvar_wo_ddp.train(training)
         
-        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
+        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), diff_loss_mean.item(), tot])
         dist.allreduce(stats)
         tot = round(stats[-1].item())
         stats /= tot
-        L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
-        return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
+        L_mean, L_tail, acc_mean, acc_tail, diff_loss, _ = stats.tolist()
+        return L_mean, L_tail, acc_mean, acc_tail, diff_loss, tot, time.time()-stt
     
     def train_step(
         self, ep:int, it: int, g_it: int, stepping: bool,  clip_decay_ratio: float,metric_lg: MetricLogger, tb_lg: TensorboardLogger,
@@ -187,7 +192,7 @@ class SRVARTrainer(object):
                 Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)).item()
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL_super[:, -self.last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
-            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
+            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm, diff_loss=diff_loss.item(), step=g_it)
         
         # log to tensorboard
         if g_it == 0 or (g_it + 1) % 500 == 0:

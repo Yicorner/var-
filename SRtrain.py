@@ -214,13 +214,13 @@ def main_training():
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         is_val_and_also_saving = (ep + 1) % args.val_and_saving_per_ep == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
-            val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
+            val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, val_diff_loss, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_mean > val_loss_mean
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)
             AR_ep_loss.update(vL_mean=val_loss_mean, vL_tail=val_loss_tail, vacc_mean=val_acc_mean, vacc_tail=val_acc_tail)
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
-            print(f' [*] [ep{ep}]  (val {tot})  Lm: {val_loss_mean:.4f}, Lt: {val_loss_tail:.4f}, Acc m&t: {val_acc_mean:.2f} {val_acc_tail:.2f},  Val cost: {cost:.2f}s')
+            print(f' [*] [ep{ep}]  (val {tot})  Lm: {val_loss_mean:.4f}, Lt: {val_loss_tail:.4f}, Acc m&t: {val_acc_mean:.2f} {val_acc_tail:.2f}, val diff_loss: {val_diff_loss:.2f}  Val cost: {cost:.2f}s')
             
             if dist.is_local_master():
                 local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
