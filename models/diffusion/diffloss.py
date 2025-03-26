@@ -22,6 +22,7 @@ class DiffLoss(nn.Module):
     ):
         super().__init__()
         self.in_channels = in_channels
+        self.img_size = img_size
         # self.net = SimpleMLPAdaLN(
         #     in_channels=target_channels,
         #     model_channels=width,
@@ -76,7 +77,7 @@ class DiffLoss(nn.Module):
             model_kwargs = dict(c=z, cfg_scale=cfg)
             sample_fn = self.net.forward_with_cfg
         else:
-            noise = torch.randn(z.shape[0], self.in_channels).cuda()
+            noise = torch.randn(z.shape[0], self.in_channels, self.img_size, self.img_size).cuda()
             model_kwargs = dict(c=z)
             sample_fn = self.net.forward
 
@@ -95,7 +96,7 @@ class DiffLoss(nn.Module):
                     model_kwargs=model_kwargs,
                     progress=False,
                     temperature=temperature,
-                )* self.vae_scale
+                )
             )
         else:
             raise NotImplementedError

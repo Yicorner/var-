@@ -578,11 +578,29 @@ class SRVAR(nn.Module):
 
         if not ret_img:
             return ret, idx_Bl_list, []
+        
 
-        img = vae.fhat_to_img(accu_BChw)
+        f_hat_diffusion = self.diffloss.sample(
+                z=accu_BChw, temperature=1.0,  cfg=1.0
+            )
+        
+        img = vae.fhat_to_img(f_hat_diffusion)
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
         return ret, idx_Bl_list, img
+
+        # f_hat_diffusion = self.diffloss.sample(
+        #         z=accu_BChw, temperature=1.0,  cfg=1.0
+        #     )
+        
+        # img = vae.fhat_to_img(f_hat_diffusion)
+        # img_old = vae.fhat_to_img(accu_BChw)
+        # img = (img + 1) / 2
+        # img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+
+        # img_old = (img_old + 1) / 2
+        # img_old = img_old.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+        # return ret, idx_Bl_list, img - img_old
     
     def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
         bs, seq_len, c = feature.shape
@@ -605,6 +623,7 @@ class SRVAR(nn.Module):
         x_BLC_list.append(x_BLC[:,ptr:])
         x_BLC = torch.cat(x_BLC_list, dim=1)
         return x_BLC
+    
     def forward(
         self, label_B_or_BLT: Tuple[torch.FloatTensor, torch.IntTensor, int], 
         x_BLC_wo_prefix: torch.Tensor,
