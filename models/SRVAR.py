@@ -584,23 +584,11 @@ class SRVAR(nn.Module):
                 z=accu_BChw, temperature=1.0,  cfg=1.0
             )
         
-        img = vae.fhat_to_img(f_hat_diffusion)
+        img = vae.fhat_to_img(f_hat_diffusion + accu_BChw)
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
         return ret, idx_Bl_list, img
 
-        # f_hat_diffusion = self.diffloss.sample(
-        #         z=accu_BChw, temperature=1.0,  cfg=1.0
-        #     )
-        
-        # img = vae.fhat_to_img(f_hat_diffusion)
-        # img_old = vae.fhat_to_img(accu_BChw)
-        # img = (img + 1) / 2
-        # img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
-
-        # img_old = (img_old + 1) / 2
-        # img_old = img_old.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
-        # return ret, idx_Bl_list, img - img_old
     
     def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
         bs, seq_len, c = feature.shape
@@ -729,9 +717,9 @@ class SRVAR(nn.Module):
 
 
         f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
-
+        f_minus_f_hat = f_hat - f_hat_predict
         diff_loss = self.forward_diff_loss(
-            z=f_hat_predict, target=f_hat
+            z=f_hat_predict, target=f_minus_f_hat
         )
         # [3. unpad the seqlen dim, and then get logits]
         return x_BLC, diff_loss    # return logits BLV, V is vocab_size    
