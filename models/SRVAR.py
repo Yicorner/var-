@@ -476,11 +476,12 @@ class SRVAR(nn.Module):
                                                         B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
             
             # idx_Bl = logits_BlV.data.argmax(dim=-1)
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0]
-            
-            beam_search_nums_modify= min(beam_search_nums,num_pn)
-            if beam_search_nums > 0 and si != num_stages_minus_1:
 
+            
+            if beam_search_nums >= 0 :
+                if si == num_stages_minus_1:
+                    continue
+                beam_search_nums_modify= min(beam_search_nums,num_pn)
                 probs = F.softmax(logits_BlV, dim=-1)
                 value_Bl, idx_Bl = probs.max(dim=-1)
                 # print("idx_BL:",idx_Bl.shape, value_Bl.shape)
@@ -554,8 +555,9 @@ class SRVAR(nn.Module):
 
                 
                 idx_Bl = beam_find_best_idx_Bl
-
-
+            else :
+                idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0]
+            
             h_BChw = vae.quantize.embedding(idx_Bl).float()   # BlC
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
             
