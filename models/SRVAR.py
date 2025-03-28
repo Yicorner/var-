@@ -474,87 +474,73 @@ class SRVAR(nn.Module):
             logits_BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
                                                         ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
                                                         B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
-            
-            # idx_Bl = logits_BlV.data.argmax(dim=-1)
 
-            
+
             if beam_search_nums >= 0 :
-                if si == num_stages_minus_1:
-                    continue
-                beam_search_nums_modify= min(beam_search_nums,num_pn)
+
                 probs = F.softmax(logits_BlV, dim=-1)
                 value_Bl, idx_Bl = probs.max(dim=-1)
-                # print("idx_BL:",idx_Bl.shape, value_Bl.shape)
-                if choose_min == "max":
-                    min_value_value_Bls,min_idx_value_Bls = value_Bl.topk(beam_search_nums_modify, dim=-1, largest=False)
-                elif choose_min == "max_2max":
-                    top2_values, top2_indices = probs.topk(2, dim=-1)
-                    prob_max_2max = 2 * top2_values[...,0] - top2_values[...,1]
-                    min_value_value_Bls,min_idx_value_Bls = prob_max_2max.topk(beam_search_nums_modify, dim=-1, largest=False)
-                
-                # print("min_Bls:",min_value_value_Bls.shape, min_idx_value_Bls.shape)
-                # print("min_value_value_Bls:",min_value_value_Bls)
-                # print("min_idx_value_Bls:",min_idx_value_Bls)
 
-                # max_value_value_Bls,max_idx_value_Bls = value_Bl.topk(beam_search_nums_modify, dim=-1, largest=True)
-                # print("max_Bls:",max_value_value_Bls.shape, max_idx_value_Bls.shape)
-                # print("max_value_value_Bls:",max_value_value_Bls)
-                # print("max_idx_value_Bls:",max_idx_value_Bls)
+                if si != num_stages_minus_1:
 
-                
-                beam_find_best_idx_Bl = idx_Bl.clone()
-                beam_find_best_score_Bl = torch.zeros(B,device=accu_BChw.device,dtype=accu_BChw.dtype)
-                for beam_search_idx in  range(2 ** beam_search_nums_modify):
-                    beam_idx_Bl = idx_Bl.clone()
-                    beam_accu_BChw = accu_BChw.clone()
-                    beam_choose_p = torch.ones((B,1),device=accu_BChw.device,dtype=accu_BChw.dtype)
-                    for _search_idx in range(beam_search_nums_modify):
+                    beam_search_nums_modify= min(beam_search_nums,num_pn)
 
-                        pos_idx = min_idx_value_Bls[...,_search_idx].unsqueeze(-1)
-                        # print("pos_idx:",pos_idx,"min_idx_value_Bls",min_idx_value_Bls.shape)
-                        # print("probs:",probs.shape)
-                        batch_indices = torch.arange(probs.shape[0], device=probs.device).view(-1, 1).expand(-1, pos_idx.shape[1])
-                        top2_values, top2_indices = probs[batch_indices,pos_idx].topk(2, dim=-1)
-                        # print("top2_indices:",top2_indices)
-                        # 
-                        if (beam_search_idx & 2**_search_idx) == 0:
-                            beam_choose_p = beam_choose_p + top2_values[...,0]
-                            continue 
-                                               
-                        beam_choose_p = beam_choose_p + top2_values[...,1]
-                        beam_idx_Bl[batch_indices,pos_idx] = top2_indices[...,1]
-                        # print(f"pos_idx:{pos_idx} chooose top2_indices:{top2_indices}")
-
-                    h_BChw = vae.quantize.embedding(beam_idx_Bl).float()   # BlC
-                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
-                    beam_accu_BChw, beam_last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), beam_accu_BChw, h_BChw)
-
-                    beam_last_stage = beam_last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
-                    beam_last_stage = self.word_embed(self.norm0_ve(beam_last_stage))
-                    beam_last_stage = beam_last_stage.repeat(bs//B, 1, 1)
-                    
-                    
-                    beam_logits_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
-                            ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
-                            B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=False)
-
-                    # 不同batch的结果应该不一样
-                    beam_probs = F.softmax(beam_logits_BlV, dim=-1)
-                    if score_compare == "max":
-                        beam_value_max_Bl, beam_idx_max_Bl = beam_probs.max(dim=-1)
-                        beam_score = beam_value_max_Bl.sum(dim=-1)
-                    elif score_compare == "max_2max":
-                        top2_values, top2_indices = beam_probs.topk(2, dim=-1)
+                    if choose_min == "max":
+                        min_value_value_Bls,min_idx_value_Bls = value_Bl.topk(beam_search_nums_modify, dim=-1, largest=False)
+                    elif choose_min == "max_2max":
+                        top2_values, top2_indices = probs.topk(2, dim=-1)
                         prob_max_2max = 2 * top2_values[...,0] - top2_values[...,1]
-                        beam_score = prob_max_2max.sum(dim=-1)
+                        min_value_value_Bls,min_idx_value_Bls = prob_max_2max.topk(beam_search_nums_modify, dim=-1, largest=False)
+                    
 
-                    for _b in range(B):
-                        if beam_find_best_score_Bl[_b] < (beam_score[_b] + beam_choose_p[_b]):
-                            beam_find_best_idx_Bl[_b] = beam_idx_Bl[_b]
-                            beam_find_best_score_Bl[_b] = (beam_score[_b] + beam_choose_p[_b])
+                    beam_find_best_idx_Bl = idx_Bl.clone()
+                    beam_find_best_score_Bl = torch.zeros(B,device=accu_BChw.device,dtype=accu_BChw.dtype)
+                    for beam_search_idx in  range(2 ** beam_search_nums_modify):
+                        beam_idx_Bl = idx_Bl.clone()
+                        beam_accu_BChw = accu_BChw.clone()
+                        beam_choose_p = torch.ones((B,1),device=accu_BChw.device,dtype=accu_BChw.dtype)
+                        for _search_idx in range(beam_search_nums_modify):
 
-                
-                idx_Bl = beam_find_best_idx_Bl
+                            pos_idx = min_idx_value_Bls[...,_search_idx].unsqueeze(-1)
+                            batch_indices = torch.arange(probs.shape[0], device=probs.device).view(-1, 1).expand(-1, pos_idx.shape[1])
+                            top2_values, top2_indices = probs[batch_indices,pos_idx].topk(2, dim=-1)
+                            if (beam_search_idx & 2**_search_idx) == 0:
+                                beam_choose_p = beam_choose_p + top2_values[...,0]
+                                continue 
+                                                
+                            beam_choose_p = beam_choose_p + top2_values[...,1]
+                            beam_idx_Bl[batch_indices,pos_idx] = top2_indices[...,1]
+                            # print(f"pos_idx:{pos_idx} chooose top2_indices:{top2_indices}")
+
+                        h_BChw = vae.quantize.embedding(beam_idx_Bl).float()   # BlC
+                        h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+                        beam_accu_BChw, beam_last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), beam_accu_BChw, h_BChw)
+
+                        beam_last_stage = beam_last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
+                        beam_last_stage = self.word_embed(self.norm0_ve(beam_last_stage))
+                        beam_last_stage = beam_last_stage.repeat(bs//B, 1, 1)
+                        
+                        
+                        beam_logits_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
+                                ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
+                                B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=False)
+
+                        # 不同batch的结果应该不一样
+                        beam_probs = F.softmax(beam_logits_BlV, dim=-1)
+                        if score_compare == "max":
+                            beam_value_max_Bl, beam_idx_max_Bl = beam_probs.max(dim=-1)
+                            beam_score = beam_value_max_Bl.sum(dim=-1)
+                        elif score_compare == "max_2max":
+                            top2_values, top2_indices = beam_probs.topk(2, dim=-1)
+                            prob_max_2max = 2 * top2_values[...,0] - top2_values[...,1]
+                            beam_score = prob_max_2max.sum(dim=-1)
+
+                        for _b in range(B):
+                            if beam_find_best_score_Bl[_b] < (beam_score[_b] + beam_choose_p[_b]):
+                                beam_find_best_idx_Bl[_b] = beam_idx_Bl[_b]
+                                beam_find_best_score_Bl[_b] = (beam_score[_b] + beam_choose_p[_b])
+
+                    idx_Bl = beam_find_best_idx_Bl
             else :
                 idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0]
             
