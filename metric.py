@@ -210,8 +210,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths):
             for i in range(B):
                 _data = nup_gt[i]
                 _rec_B3HW = nup_test[i]
-                Image.fromarray(_rec_B3HW).save(os.path.join(predict_dir,f"{idx*B+i}.jpg"))
-                Image.fromarray(_data).save(os.path.join(gt_dir,f"{idx*B+i}.jpg"))
+                Image.fromarray(_rec_B3HW).save(os.path.join(predict_dir,f"{idx*B+i}.png"))
+                Image.fromarray(_data).save(os.path.join(gt_dir,f"{idx*B+i}.png"))
 
     
 
@@ -240,7 +240,7 @@ def metric(metric_path,ckpt_paths):
         musiq_iqa = []
         maniqa_iqa = []
         clip_iqa = []
-        gt_img_paths.extend(sorted(glob.glob(f'{gt_dir}/*.jpg'))[:])
+        gt_img_paths.extend(sorted(glob.glob(f'{gt_dir}/*.png'))[:])
         
         
         for gt_img_path in tqdm(gt_img_paths):
