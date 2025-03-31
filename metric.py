@@ -88,14 +88,16 @@ def rgb2ycbcr_pt(img, y_only=False):
 
 def get_value(x):
     return x.item() if isinstance(x, torch.Tensor) else x
-def write_metrics_to_file(filename, metric_name, values):
+def write_metrics_to_file(filename, metric_name, values, outCMD =False):
     mean_val = sum(values) / len(values)
     max_val = max(values)
     min_val = min(values)
+    if( outCMD):
+        print(f"{metric_name}: Mean = {get_value(mean_val)}, Max = {get_value(max_val)}, Min = {get_value(min_val)}")
     with open(filename, "a") as f:
         f.write(f"{metric_name}: Mean = {get_value(mean_val)}, Max = {get_value(max_val)}, Min = {get_value(min_val)}\n")
 
-def get_img(args, ld_val, maxtot, ckpt_paths):
+def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score_compare):
     
     V=args.vocab_size
     Cvae=args.Ct5
@@ -200,7 +202,11 @@ def get_img(args, ld_val, maxtot, ckpt_paths):
             ret, idx_Bl_list, img = srvar.autoregressive_infer_cfg(vae=vae, label_B_or_BLT=label_B_or_BLT, 
                                 scale_schedule=scale_schedule,
                                 ret_img=True,
-                                B=B)
+                                B=B,
+                                choose_min=choose_min,
+                                score_compare=score_compare,
+                                beam_search_nums = beam_search_nums
+                                )
 
             nup_test = img.detach().cpu().numpy()
 
@@ -216,7 +222,7 @@ def get_img(args, ld_val, maxtot, ckpt_paths):
     
 
     
-def metric(metric_path,ckpt_paths):
+def metric(metric_path,ckpt_paths,beam_search_nums,choose_min,score_compare):
     img_preproc = transforms.Compose([
         transforms.ToTensor(),
     ])
@@ -281,7 +287,7 @@ def metric(metric_path,ckpt_paths):
 if __name__ == "__main__":
     args: arg_util.Args = arg_util.Args()
 
-    args.batch_size = 4
+    args.batch_size = 24
     args.fp16=1
     args.alng = 1e-3
     args.wpe = 0.1
@@ -298,6 +304,11 @@ if __name__ == "__main__":
     maxtot = -1
     out_path = "./metric.txt"
 
+
+    beam_search_nums = 0
+    choose_min = "max"
+    score_compare = "max"
+
     args.seed = 666
     args.seed_everything(False)
 
@@ -308,16 +319,22 @@ if __name__ == "__main__":
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
 
     ld_val = DataLoader(
-        dataset_val, num_workers=args.workers, batch_size=args.batch_size,shuffle=False,
+        dataset_val, num_workers=args.workers, batch_size=args.batch_size,shuffle=True,
     )
 
 
     ld_train = DataLoader(
-        dataset=dataset_train, num_workers=args.workers,batch_size=args.batch_size,shuffle=True,
+        dataset=dataset_train, num_workers=args.workers,batch_size=args.batch_size,shuffle=False,
     )
     del dataset_val,dataset_train
     
-    # ckpt_paths = ["ckpt_save/2/2_ar-ckpt-best.pth","ckpt_save/1/1_ar-ckpt-last.pth"]
-    ckpt_paths = ["local_output/ar-ckpt-last.pth","ckpt_save/2/2_ar-ckpt-best.pth"]
-    get_img(args,ld_val,maxtot,ckpt_paths)
-    metric(out_path,ckpt_paths)
+    # ckpt_paths = [f"local_output/ckpt-{i}.pth" for i in range(252,281,3)]
+    ckpt_paths = [f"local_output/ckpt-{321}.pth"]
+    print(ckpt_paths)
+
+    get_img(args = args,ld_val = ld_val ,maxtot = maxtot,ckpt_paths = ckpt_paths,
+                        beam_search_nums = beam_search_nums,
+                        choose_min = choose_min,
+                        score_compare = score_compare)
+    metric(out_path,ckpt_paths ,beam_search_nums = beam_search_nums,choose_min = choose_min,score_compare = score_compare)
+
