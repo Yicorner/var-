@@ -201,8 +201,7 @@ class SRVAR(nn.Module):
         ) 
         self.encoder = Encoder(double_z=False, **ddconfig)
         self.quant_conv = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
-        self.encoder.load_state_dict(vae_local.encoder.state_dict())
-        self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
+
         
         
         self.rng = torch.Generator(device=dist.get_device())
@@ -826,6 +825,11 @@ class SRVAR(nn.Module):
                     nn.init.constant_(m.bias.data, 0.)
                 if m.weight is not None:
                     nn.init.constant_(m.weight.data, 1.)
+    
+    def init_LREncoder(self, vae_local: VQVAE):
+        self.encoder.load_state_dict(vae_local.encoder.state_dict())
+        self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
+        
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
 

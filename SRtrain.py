@@ -107,7 +107,7 @@ def build_everything(args: arg_util.Args):
         args.tini = math.sqrt(1 / srvar_wo_ddp.C / 3)
     srvar_wo_ddp.init_weights(other_std=args.tini)
     srvar_wo_ddp.special_init(aln_init=args.aln, aln_gamma_init=args.alng, scale_head=args.hd0, scale_proj=args.diva)
-
+    srvar_wo_ddp.init_LREncoder(vae_local)
             
 
     ndim_dict = {name: para.ndim for name, para in srvar_wo_ddp.named_parameters() if para.requires_grad}
