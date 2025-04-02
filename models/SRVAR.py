@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from .basic_vae import Encoder
 from models.flex_attn import FlexAttn
 
 import dist
@@ -192,6 +192,18 @@ class SRVAR(nn.Module):
         assert round(t.sum().item()) in {0, dist.get_world_size()}, f'flash_fused_op_installed: {t}'
         
         super().__init__()
+        
+        ddconfig = dict(
+            dropout=vae_local.dropout, ch=vae_local.ch, z_channels=vae_local.Cvae,
+            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
+            using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
+            # resamp_with_conv=True,   # always True, removed.
+        ) 
+        self.encoder = Encoder(double_z=False, **ddconfig)
+        self.quant_conv = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
+        self.encoder.load_state_dict(vae_local.encoder.state_dict())
+        self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
+        
         
         self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
@@ -601,7 +613,9 @@ class SRVAR(nn.Module):
         return x_BLC
     
     def forward(
-        self, label_B_or_BLT: Tuple[torch.FloatTensor, torch.IntTensor, int], 
+        self, 
+        inp_B3HW_low: torch.Tensor,
+        # label_B_or_BLT: Tuple[torch.FloatTensor, torch.IntTensor, int], 
         x_BLC_wo_prefix: torch.Tensor,
         scale_schedule:List[Tuple[int]],
         f_hat :torch.Tensor,
@@ -611,13 +625,24 @@ class SRVAR(nn.Module):
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
         # if cfg_infer:
         #     return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
-        
-        x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
+
         B = x_BLC_wo_prefix.shape[0]
+
+        x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         
         # [1. get input sequence x_BLC]
         with torch.amp.autocast('cuda', enabled=False):
-            kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+            low_f = self.quant_conv(self.encoder(inp_B3HW_low))
+            low_f = low_f.permute(0, 2, 3, 1)
+            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+            # [3,679,32]
+            lowLen, lowC = low_f.shape[1], low_f.shape[2]
+            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLC_wo_prefix.device)  # 每个句子的 token 长度
+            max_seqlen_k = lens.max().to(device=x_BLC_wo_prefix.device)  # 5
+            cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLC_wo_prefix.device), lens]), dim=0).to(device=x_BLC_wo_prefix.device).to(dtype = torch.int32)
+            
+            
+            kv_compact = low_f
             if(len(kv_compact.shape) == 3): # B L C -> B*L C
                 kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])
             # drop cond

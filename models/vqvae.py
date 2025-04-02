@@ -26,6 +26,9 @@ class VQVAE(nn.Module):
         test_mode=True,
     ):
         super().__init__()
+        self.quant_conv_ks = quant_conv_ks
+        self.dropout = dropout
+        self.ch = ch
         self.test_mode = test_mode
         self.V, self.Cvae = vocab_size, z_channels
         # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
