@@ -50,7 +50,7 @@ def build_everything(args: arg_util.Args):
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         dataset_train, dataset_val = build_dataset(
-            args.data_path, augment=True
+            args.data_path, augment=True, use_ref=args.use_ref
         )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
@@ -214,7 +214,7 @@ def main_training():
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         is_val_and_also_saving = (ep + 1) % args.val_and_saving_per_ep == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
-            val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, val_diff_loss, tot, cost = trainer.eval_ep(ld_val)
+            val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, val_diff_loss, tot, cost = trainer.eval_ep(ld_val, use_ref=args.use_ref)
             best_updated = best_val_loss_mean > val_loss_mean
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)
@@ -286,7 +286,12 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
-    for it, (low, super) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    for it, datas in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+        if args.use_ref:
+            low, super, ref = datas
+        else :
+            low, super = datas
+            ref = None
         g_it = ep * iters_train + it
         if it < start_it: continue
         # if is_first_ep and it == start_it: warnings.resetwarnings()
@@ -318,7 +323,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         
         grad_norm, scale_log2 = trainer.train_step(
             ep=ep, it=it, g_it=g_it, stepping=stepping,clip_decay_ratio=clip_decay_ratio, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW_low=low, inp_B3HW_super=super, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+            inp_B3HW_low=low, inp_B3HW_super=super, ref_B3HW = ref , prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
         
         me.update(tlr=max_tlr)

@@ -62,33 +62,25 @@ class SRVARTrainer(object):
         self.first_prog = True
     
     @torch.no_grad()
-    def eval_ep(self, ld_val: DataLoader):
+    def eval_ep(self, ld_val: DataLoader, use_ref):
         tot = 0
         L_mean, L_tail, acc_mean, acc_tail, diff_loss_mean = 0, 0, 0, 0, 0
         stt = time.time()
         training = self.srvar_wo_ddp.training
         self.srvar_wo_ddp.eval()
-        for inp_B3HW_low, inp_B3HW_super in ld_val:
-            
+        for datas in ld_val:
+            if use_ref:
+                inp_B3HW_low, inp_B3HW_super, ref_B3HW = datas
+            else:
+                inp_B3HW_low, inp_B3HW_super = datas
+                ref_B3HW = None
             B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
             inp_B3HW_low = inp_B3HW_low.to(dist.get_device(), non_blocking=True)
             inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
             
-            low_f = self.vae_local.img_to_f(inp_B3HW_low)
-            low_f = low_f.permute(0, 2, 3, 1)
-            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
-            
             gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
             gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
             x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
-            
-            lowLen, lowC = low_f.shape[1], low_f.shape[2]
-            
-            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device)  # 每个句子的 token 长度
-            max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_super.device)  # 5
-            cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_super.device).to(dtype = torch.int32)
-            label_B_or_BLT = (low_f, lens, cu_seqlens_k, max_seqlen_k)
-            
             
             h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
             T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
@@ -98,7 +90,9 @@ class SRVARTrainer(object):
             scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
             
             self.srvar_wo_ddp.forward
-            logits_BLV, diff_loss = self.srvar(label_B_or_BLT = label_B_or_BLT, \
+            logits_BLV, diff_loss = self.srvar(
+                                    inp_B3HW_low = inp_B3HW_low, \
+                                    ref_B3HW = ref_B3HW, \
                                     x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
                                     scale_schedule = scale_schedule, \
                                     f_hat = f_hat_super, \
@@ -111,7 +105,10 @@ class SRVARTrainer(object):
             tot += B
         self.srvar_wo_ddp.train(training)
         
-        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), diff_loss_mean.item(), tot])
+        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), 
+                                   acc_mean.item(), acc_tail.item(), 
+                                   diff_loss_mean.item() if isinstance(diff_loss_mean, torch.Tensor) else diff_loss_mean,
+                                   tot])
         dist.allreduce(stats)
         tot = round(stats[-1].item())
         stats /= tot
@@ -120,7 +117,7 @@ class SRVARTrainer(object):
     
     def train_step(
         self, ep:int, it: int, g_it: int, stepping: bool,  clip_decay_ratio: float,metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        inp_B3HW_low: FTen, inp_B3HW_super: FTen, prog_si: int, prog_wp_it: float,
+        inp_B3HW_low: FTen, inp_B3HW_super: FTen, ref_B3HW: Optional[FTen], prog_si: int, prog_wp_it: float,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         
         
@@ -155,6 +152,7 @@ class SRVARTrainer(object):
             self.srvar_wo_ddp.forward
             logits_BLV, diff_loss = self.srvar(inp_B3HW_low = inp_B3HW_low, \
                                                x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
+                                                ref_B3HW = ref_B3HW, \
                                                scale_schedule = scale_schedule, \
                                                f_hat = f_hat_super, \
                                                vae_local=self.vae_local)
@@ -182,7 +180,9 @@ class SRVARTrainer(object):
                 Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)).item()
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL_super[:, -self.last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
-            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm, diff_loss=diff_loss.item(), step=g_it)
+            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm, 
+                             diff_loss=diff_loss.item() if isinstance(diff_loss, torch.Tensor) else diff_loss, 
+                             step=g_it)
         
         # log to tensorboard
         if g_it == 0 or (g_it + 1) % 500 == 0:
@@ -226,7 +226,8 @@ class SRVARTrainer(object):
         return state
     
     def load_state_dict(self, state, strict=True, skip_vae=False):
-        for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
+        # for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
+        for k in ('srvar_wo_ddp', 'vae_local'):
             if skip_vae and 'vae' in k: continue
             m = getattr(self, k)
             if m is not None:

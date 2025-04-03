@@ -23,6 +23,8 @@ import dist
 
 
 class Args(Tap):
+    use_ref: bool = False
+    use_diff:bool = False
     zero: int = 0                       # ds zero
     data_path: str = '/path/to/imagenet'
     enable_checkpointing: str = None    # checkpointing strategy: full-block, self-attn

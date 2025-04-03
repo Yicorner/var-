@@ -44,7 +44,7 @@ class DiffLoss(nn.Module):
         self.num_sampling_steps = num_sampling_steps
         self.sampler = sampler
 
-        self.train_diffusion = create_diffusion(
+        self.use_diffusion = create_diffusion(
             timestep_respacing="", noise_schedule="cosine"
         )
         self.gen_diffusion = create_diffusion(
@@ -56,12 +56,12 @@ class DiffLoss(nn.Module):
     def forward(self, target, z, mask=None):
         t = torch.randint(
             0,
-            self.train_diffusion.num_timesteps,
+            self.use_diffusion.num_timesteps,
             (target.shape[0],),
             device=target.device,
         )
         model_kwargs = dict(c=z)
-        loss_dict = self.train_diffusion.training_losses(
+        loss_dict = self.use_diffusion.training_losses(
             self.net, target,  t, model_kwargs
         )
         loss = loss_dict["loss"]

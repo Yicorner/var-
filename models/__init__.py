@@ -36,6 +36,8 @@ def build_vae_srvar(# Shared args
         always_training_scales=args.always_training_scales,
         apply_spatial_patchify=args.apply_spatial_patchify,
         block_chunks = args.block_chunks,
+        use_diff = args.use_diff,
+        use_ref = args.use_ref,
 
     )
     if args.dp >= 0: srvar_kw['drop_path_rate'] = args.dp

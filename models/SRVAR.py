@@ -109,6 +109,8 @@ class SRVAR(nn.Module):
         always_training_scales=20,
         apply_spatial_patchify = 0,
         inference_mode=False,
+        use_ref = False,
+        use_diff = False,
     ):
         
         # set hyperparameters
@@ -202,8 +204,13 @@ class SRVAR(nn.Module):
         self.encoder = Encoder(double_z=False, **ddconfig)
         self.quant_conv = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
 
+        self.use_ref = use_ref
+        if use_ref:
+            self.encoder_ref = Encoder(double_z=False, **ddconfig)
+            self.quant_conv_ref = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
         
-        
+        self.use_diff = use_diff
+
         self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
         self.low_len = low_len
@@ -326,13 +333,13 @@ class SRVAR(nn.Module):
             f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
-        
-        self.diffloss = DiffLoss(
-            in_channels=vae_local.Cvae,
-            img_size=16,
-            num_sampling_steps='10',
-            sampler='iddpm',
-        )
+        if self.use_diff:
+            self.diffloss = DiffLoss(
+                in_channels=vae_local.Cvae,
+                img_size=16,
+                num_sampling_steps='10',
+                sampler='iddpm',
+            )
     
     def forward_diff_loss(self, z, target, mask=None):
         loss = self.diffloss(z=z, target=target, mask=mask)
@@ -619,6 +626,7 @@ class SRVAR(nn.Module):
         scale_schedule:List[Tuple[int]],
         f_hat :torch.Tensor,
         vae_local :VQVAE,
+        ref_B3HW: Optional[torch.Tensor] = None,
         cfg_infer=False,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
@@ -634,12 +642,18 @@ class SRVAR(nn.Module):
             low_f = self.quant_conv(self.encoder(inp_B3HW_low))
             low_f = low_f.permute(0, 2, 3, 1)
             low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+            
+            if self.use_ref:
+                ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
+                ref_f = ref_f.permute(0, 2, 3, 1)
+                ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# B=36
+                low_f = torch.cat((low_f, ref_f), dim=1)
+
             # [3,679,32]
             lowLen, lowC = low_f.shape[1], low_f.shape[2]
             lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLC_wo_prefix.device)  # 每个句子的 token 长度
             max_seqlen_k = lens.max().to(device=x_BLC_wo_prefix.device)  # 5
             cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLC_wo_prefix.device), lens]), dim=0).to(device=x_BLC_wo_prefix.device).to(dtype = torch.int32)
-            
             
             kv_compact = low_f
             if(len(kv_compact.shape) == 3): # B L C -> B*L C
@@ -719,22 +733,25 @@ class SRVAR(nn.Module):
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
         
         x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD)
-        idx_Bl = x_BLC.argmax(dim=-1)
-        idx_Bl_list = []
-        curL = 0
-        for scale in scale_schedule:
-            curL_next = curL + np.prod(scale)
-            idx_Bl_list.append(idx_Bl[:, curL:curL_next])
-            curL = curL_next
+        diff_loss = 0.0
+
+        if self.use_diff:
+            idx_Bl = x_BLC.argmax(dim=-1)
+            idx_Bl_list = []
+            curL = 0
+            for scale in scale_schedule:
+                curL_next = curL + np.prod(scale)
+                idx_Bl_list.append(idx_Bl[:, curL:curL_next])
+                curL = curL_next
 
 
-        f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
-        f_minus_f_hat = f_hat - f_hat_predict
-        f_hat_predict_detach = f_hat_predict.detach()
-        f_minus_f_hat_detach = f_minus_f_hat.detach()
-        diff_loss = self.forward_diff_loss(
-            z=f_minus_f_hat_detach, target=f_minus_f_hat_detach
-        )
+            f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
+            f_minus_f_hat = f_hat - f_hat_predict
+            f_hat_predict_detach = f_hat_predict.detach()
+            f_minus_f_hat_detach = f_minus_f_hat.detach()
+            diff_loss = self.forward_diff_loss(
+                z=f_minus_f_hat_detach, target=f_minus_f_hat_detach
+            )
         # [3. unpad the seqlen dim, and then get logits]
         return x_BLC, diff_loss    # return logits BLV, V is vocab_size    
         
@@ -831,6 +848,10 @@ class SRVAR(nn.Module):
     def init_LREncoder(self, vae_local: VQVAE):
         self.encoder.load_state_dict(vae_local.encoder.state_dict())
         self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
+
+        if self.use_ref:
+            self.encoder_ref.load_state_dict(vae_local.encoder.state_dict())
+            self.quant_conv_ref.load_state_dict(vae_local.quant_conv.state_dict())
         
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
