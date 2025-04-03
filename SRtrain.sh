@@ -14,8 +14,10 @@ torchrun --nproc_per_node=2 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --m
 --wp=0.00000001 \
 --fp16=1 \
 --tini=-1 \
---val_and_saving_per_ep=3 \
---use_are_loss_weight=True
+--val_and_saving_per_ep=1 \
+--use_are_loss_weight=True \
+--use_ref=True \
+--use_diff=True
 # --vae_ckpt="ckpt_256/ckpt-best.pth" \
 # --pad_to_multiplier=128 --use_flex_attn=True 
 # fp16 infity是2(bf16) var是1(fp16)
