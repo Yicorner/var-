@@ -290,6 +290,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         
         low = low.to(args.device, non_blocking=True)
         super = super.to(args.device, non_blocking=True)
+        ref = ref.to(args.device, non_blocking=True) if ref is not None else None
         
         args.cur_it = f'{it+1}/{iters_train}'
         
