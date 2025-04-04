@@ -128,6 +128,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
         always_training_scales=args.always_training_scales,
         apply_spatial_patchify=args.apply_spatial_patchify,
         block_chunks = args.block_chunks,
+        use_diff = args.use_diff,
+        use_ref = args.use_ref,
 
     )
     if args.dp >= 0: srvar_kw['drop_path_rate'] = args.dp
@@ -148,29 +150,25 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
         os.makedirs(predict_dir,exist_ok=True)
         os.makedirs(gt_dir,exist_ok=True)
         
-        for idx, (inp_B3HW_low, inp_B3HW_super) in tqdm(enumerate(ld_val), total=len(ld_val)):
+        for idx, datas in tqdm(enumerate(ld_val), total=len(ld_val)):
             if(idx>=maxtot and maxtot>0):
                 break
+            if args.use_ref:
+                inp_B3HW_low, inp_B3HW_super, ref_B3HW = datas
+            else :
+                inp_B3HW_low, inp_B3HW_super = datas
+                ref_B3HW = None
             
             inp_B3HW_low = inp_B3HW_low.to(dist.get_device(), non_blocking=True)
             inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
+            ref_B3HW = ref_B3HW.to(dist.get_device(), non_blocking=True) if ref_B3HW is not None else None
             
             B, V = inp_B3HW_low.shape[0], vae.vocab_size
             
-            low_f = vae.img_to_f(inp_B3HW_low)
-            low_f = low_f.permute(0, 2, 3, 1)
-            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
             
             gt_idx_Bl_super= vae.img_to_idxBl(inp_B3HW_super)
             gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
             x_BLCv_wo_first_l_super= vae.quantize.idxBl_to_var_input(gt_idx_Bl_super)
-
-            lowLen, lowC = low_f.shape[1], low_f.shape[2]
-            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device)  # 每个句子的 token 长度
-            low_f = low_f.reshape( -1, lowC)
-            max_seqlen_k = lens.max().to(device=x_BLCv_wo_first_l_super.device)  # 5
-            cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLCv_wo_first_l_super.device), lens]), dim=0).to(device=x_BLCv_wo_first_l_super.device).to(dtype = torch.int32)
-            label_B_or_BLT = (low_f, lens, cu_seqlens_k, max_seqlen_k)
             
             h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
             T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
@@ -179,27 +177,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
             scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
             scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
             
-            # idx_predict = []
-            # for si,pn in enumerate(patch_nums):
-            #     idx_predict.append(torch.zeros(B,pn*pn,dtype=torch.int64).to(device=inp_B3HW_low.device))
-            
-            # Cul_L = 0
-            # for si, pn in enumerate(patch_nums):
-            #     num_pn = pn*pn
-            #     temp_BLC = vae.quantize.idxBl_to_var_input(idx_predict)
-            #     logits_BLV = srvar(label_B_or_BLT, temp_BLC ,scale_schedule,cfg_infer=True)
-            #     idx_temp = logits_BLV.data.argmax(dim=-1)
-                
-            #     idx_predict[si] = idx_temp[:,Cul_L:Cul_L+num_pn].reshape(B,num_pn)
-            #     Cul_L = Cul_L + num_pn
-                
-            # idx_Bl_list = idx_predict
-            # idx_predict = torch.cat(idx_predict,dim=1)
-            
-            # nup_test = vae.idxBl_to_img(idx_Bl_list, same_shape=True, last_one=True)
-            # nup_test = process_image(nup_test)
 
-            ret, idx_Bl_list, img = srvar.autoregressive_infer_cfg(vae=vae, label_B_or_BLT=label_B_or_BLT, 
+            ret, idx_Bl_list, img = srvar.autoregressive_infer_cfg(vae=vae, inp_B3HW_low=inp_B3HW_low, ref_B3HW = ref_B3HW, 
                                 scale_schedule=scale_schedule,
                                 ret_img=True,
                                 B=B,
@@ -209,8 +188,6 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
                                 )
 
             nup_test = img.detach().cpu().numpy()
-
-
             nup_gt = process_image(inp_B3HW_super)
 
             for i in range(B):
@@ -269,8 +246,8 @@ def metric(metric_path,ckpt_paths,beam_search_nums,choose_min,score_compare):
             niqe_score.append(niqe_iqa_metric(prediction_img_path))
 
         with open(metric_path, "a") as f:
-            f.write(f"fold = {fold}\n")
-        write_metrics_to_file(metric_path, "PSNR", psnr_folder)
+            f.write(f"fold = {fold} {beam_search_nums} {choose_min} {score_compare}\n")
+        write_metrics_to_file(metric_path, "PSNR", psnr_folder, True)
         write_metrics_to_file(metric_path, "SSIM", ssim_folder)
         write_metrics_to_file(metric_path, "LPIPS", lpips_iqa)
         write_metrics_to_file(metric_path, "DISTS", dists_score)
@@ -300,8 +277,10 @@ if __name__ == "__main__":
 
     args.Ct5 = 32
     args.vocab_size = 4096
-    args.data_path = "./data/brats_256_t1_2021_pair_4x/"
-    maxtot = -1
+    args.data_path = "../vaex/data/mix_data/"
+    maxtot = 5
+    args.use_diff = False
+    args.use_ref = False
     out_path = "./metric.txt"
 
 
@@ -314,7 +293,7 @@ if __name__ == "__main__":
 
 
     dataset_train, dataset_val = build_dataset(
-        args.data_path,augment=False
+        args.data_path,augment=False,use_ref=args.use_ref
     )
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
 

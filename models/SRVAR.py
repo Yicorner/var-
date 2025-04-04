@@ -436,7 +436,8 @@ class SRVAR(nn.Module):
         self,
         vae=None,
         scale_schedule=None,
-        label_B_or_BLT=None,
+        inp_B3HW_low = None,
+        ref_B3HW=None,
         B=1, 
         g_seed=None, 
         returns_vemb=0, 
@@ -450,10 +451,28 @@ class SRVAR(nn.Module):
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
         
-        kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+        low_f = self.quant_conv(self.encoder(inp_B3HW_low))
+        low_f = low_f.permute(0, 2, 3, 1)
+        low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+        
+        if self.use_ref:
+            ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
+            ref_f = ref_f.permute(0, 2, 3, 1)
+            ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# B=36
+            low_f = torch.cat((low_f, ref_f), dim=1)
+
+        # [3,679,32]
+        lowLen, lowC = low_f.shape[1], low_f.shape[2]
+        lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=inp_B3HW_low.device)  # 每个句子的 token 长度
+        max_seqlen_k = lens.max().to(device=inp_B3HW_low.device)  # 5
+        cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=inp_B3HW_low.device), lens]), dim=0).to(device=inp_B3HW_low.device).to(dtype = torch.int32)
+        
+        kv_compact = low_f
+        
+        if(len(kv_compact.shape) == 3): # B L C -> B*L C
+            kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])
 
         bs = B
-            
         kv_compact = self.low_norm(kv_compact)
         sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
         
@@ -463,19 +482,15 @@ class SRVAR(nn.Module):
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+            
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list = []
-        
-
         accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
-        
-        
         num_stages_minus_1 = len(scale_schedule)-1
 
         need_to_pad = 0
         attn_fn = None
 
-        self.use_flex_attn = False
         if self.use_flex_attn:
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
 
@@ -585,14 +600,15 @@ class SRVAR(nn.Module):
         if not ret_img:
             return ret, idx_Bl_list, []
         
-
-        f_hat_diffusion = self.diffloss.sample(
-                z=accu_BChw, temperature=1.0,  cfg=1.0
-            )
-        
-        img = vae.fhat_to_img(f_hat_diffusion + accu_BChw)
+        if self.use_diff:
+            f_hat_diffusion = self.diffloss.sample(
+                    z=accu_BChw, temperature=1.0,  cfg=1.0
+                )
+            accu_BChw = f_hat_diffusion + accu_BChw 
+        img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
+        
         return ret, idx_Bl_list, img
 
     
@@ -852,6 +868,8 @@ class SRVAR(nn.Module):
         if self.use_ref:
             self.encoder_ref.load_state_dict(vae_local.encoder.state_dict())
             self.quant_conv_ref.load_state_dict(vae_local.quant_conv.state_dict())
+        
+        print("LRencoder loaded from vae_local")
         
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
