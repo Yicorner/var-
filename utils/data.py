@@ -85,6 +85,11 @@ class PairedImageDataset(Dataset): # 这里没用做任何加强，只是读取�
         if self.same_shape and low_img.size != super_img.size:
             low_img = low_img.resize(super_img.size, Image.BICUBIC)
         
+        if "file" in self.filenames[idx] or "LIDC-IDRI" in self.filenames[idx]:
+            flip_aixis = 0
+        else :
+            flip_aixis = 1
+        
         if self.augment:
             flip_p = random.random() > 0.50
             crop_p = random.random() > 0.33
@@ -92,15 +97,15 @@ class PairedImageDataset(Dataset): # 这里没用做任何加强，只是读取�
                 if crop_p:
                     low_img, super_img, ref_img = center_crop_arr([low_img, super_img, ref_img], super_img.size[0])
                 if flip_p:
-                    low_img = low_img.transpose(1)
-                    super_img = super_img.transpose(1)
-                    ref_img = ref_img.transpose(1)
+                    low_img = low_img.transpose(flip_aixis)
+                    super_img = super_img.transpose(flip_aixis)
+                    ref_img = ref_img.transpose(flip_aixis)
             else :
                 if crop_p:
                     low_img, super_img = center_crop_arr([low_img, super_img], super_img.size[0])
                 if flip_p:
-                    low_img = low_img.transpose(1)
-                    super_img = super_img.transpose(1)
+                    low_img = low_img.transpose(flip_aixis)
+                    super_img = super_img.transpose(flip_aixis)
             
         if self.transform:
             low_img = self.transform(low_img)
