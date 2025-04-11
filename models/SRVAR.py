@@ -766,7 +766,7 @@ class SRVAR(nn.Module):
             f_hat_predict_detach = f_hat_predict.detach()
             f_minus_f_hat_detach = f_minus_f_hat.detach()
             diff_loss = self.forward_diff_loss(
-                z=f_minus_f_hat_detach, target=f_minus_f_hat_detach
+                z=f_hat_predict_detach, target=f_minus_f_hat_detach
             )
         # [3. unpad the seqlen dim, and then get logits]
         return x_BLC, diff_loss    # return logits BLV, V is vocab_size    
