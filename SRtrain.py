@@ -90,7 +90,7 @@ def build_everything(args: arg_util.Args):
 
     vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
     if "trainer" in vae_ckpt.keys():
-        vae_ckpt = vae_ckpt["trainer"]["vae_wo_ddp"]    
+        vae_ckpt = vae_ckpt["trainer"]["vae_ema"]    
     vae_local.load_state_dict(vae_ckpt, strict=True)
     print(f"loaded vae from {args.vae_ckpt}")
     
@@ -158,7 +158,7 @@ def build_everything(args: arg_util.Args):
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
-        print("load var and skip var's vaex!")
+        
     del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim
     
     dist.barrier()
