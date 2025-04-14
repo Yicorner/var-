@@ -226,8 +226,7 @@ class SRVARTrainer(object):
         return state
     
     def load_state_dict(self, state, strict=True, skip_vae=False):
-        # for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
-        for k in ('srvar_wo_ddp', 'vae_local'):
+        for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
             if skip_vae and 'vae' in k: continue
             m = getattr(self, k)
             if m is not None:
