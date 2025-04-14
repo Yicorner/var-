@@ -407,6 +407,80 @@ class QKVAttention(nn.Module):
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
 
+class SEBlock(nn.Module):
+    """通道注意力机制（Squeeze-and-Excitation）"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class ResidualBlock(nn.Module):
+    """残差块（带通道注意力）"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.se = SEBlock(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(residual)
+        return F.relu(out)
+
+class ChannelReducer(nn.Module):
+    """使用for循环构建的通道压缩网络"""
+    def __init__(self, in_channels=2048, out_channels=32, reduction_ratio=0.5):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        current_channels = in_channels
+        
+        # 动态计算每个阶段的输出通道数
+        while current_channels > out_channels * 2:  # 确保最后一次压缩到目标维度
+            next_channels = max(int(current_channels * reduction_ratio), out_channels)
+            self.layers.append(
+                nn.Sequential(
+                    ResidualBlock(current_channels, next_channels),
+                    nn.Conv2d(next_channels, next_channels, kernel_size=1)
+                )
+            )
+            current_channels = next_channels
+        
+        # 最终层（确保输出为out_channels）
+        self.final_conv = nn.Sequential(
+            ResidualBlock(current_channels, out_channels * 2),
+            nn.Conv2d(out_channels * 2, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        x = self.final_conv(x)
+        return x
 
 class UNetModel(nn.Module):
     """
@@ -441,6 +515,7 @@ class UNetModel(nn.Module):
     def __init__(
         self,
         image_size,
+        cond_channels,
         in_channels,
         model_channels,
         out_channels,
@@ -720,6 +795,8 @@ class UNetModel(nn.Module):
             conv_nd(dims, model_channels, n_embed, 1),
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
+            
+        self.condition_net = ChannelReducer(in_channels=cond_channels,out_channels=in_channels) 
 
     def convert_to_fp16(self):
         """
@@ -750,6 +827,7 @@ class UNetModel(nn.Module):
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
+        c = self.condition_net(c)
         x = x + c
         for module in self.input_blocks:
             x = module(x, emb)

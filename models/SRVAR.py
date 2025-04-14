@@ -336,6 +336,7 @@ class SRVAR(nn.Module):
         if self.use_diff:
             self.diffloss = DiffLoss(
                 in_channels=vae_local.Cvae,
+                cond_channels=self.C,
                 img_size=16,
                 num_sampling_steps='10',
                 sampler='iddpm',
@@ -407,7 +408,6 @@ class SRVAR(nn.Module):
                    last_stage,
                    cond_BD_or_gss,
                    ca_kv,
-                   cond_BD,
                    scale_schedule,
                    B,
                    need_to_pad,
@@ -429,7 +429,7 @@ class SRVAR(nn.Module):
                 last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
 
 
-        return  self.get_logits(last_stage[:B], cond_BD[:B])
+        return  last_stage[:B]
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
@@ -504,11 +504,13 @@ class SRVAR(nn.Module):
             cur_L += num_pn
             nex_is = si+1
 
-            logits_BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
-                                                        ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
+            BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
+                                                        ca_kv = ca_kv, scale_schedule=scale_schedule, \
                                                         B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
-
-
+            if si == num_stages_minus_1:
+                last_layer_cond = BlV
+                last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
+            logits_BlV = self.get_logits(BlV[:B], cond_BD[:B])  
             if beam_search_nums >= 0 :
 
                 probs = F.softmax(logits_BlV, dim=-1)
@@ -554,10 +556,10 @@ class SRVAR(nn.Module):
                         beam_last_stage = beam_last_stage.repeat(bs//B, 1, 1)
                         
                         
-                        beam_logits_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
-                                ca_kv = ca_kv, cond_BD=cond_BD, scale_schedule=scale_schedule, \
+                        beam_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
+                                ca_kv = ca_kv, scale_schedule=scale_schedule, \
                                 B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=False)
-
+                        beam_logits_BlV = self.get_logits(beam_BlV[:B], cond_BD[:B])   
                         # 不同batch的结果应该不一样
                         beam_probs = F.softmax(beam_logits_BlV, dim=-1)
                         if score_compare == "max":
@@ -602,9 +604,10 @@ class SRVAR(nn.Module):
         
         if self.use_diff:
             f_hat_diffusion = self.diffloss.sample(
-                    z=accu_BChw, temperature=1.0,  cfg=1.0
+                    z=last_layer_cond, temperature=1.0,  cfg=1.0
                 )
             accu_BChw = f_hat_diffusion + accu_BChw 
+
         img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
@@ -748,6 +751,10 @@ class SRVAR(nn.Module):
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
         
+        if self.use_diff:
+            start = sum([pn[0]*pn[1]*pn[2] for pn in scale_schedule[:-1]])
+            last_layer_cond = x_BLC[:, start: , :]
+            last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
         x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD)
         diff_loss = 0.0
 
@@ -760,13 +767,11 @@ class SRVAR(nn.Module):
                 idx_Bl_list.append(idx_Bl[:, curL:curL_next])
                 curL = curL_next
 
-
             f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
             f_minus_f_hat = f_hat - f_hat_predict
-            f_hat_predict_detach = f_hat_predict.detach()
             f_minus_f_hat_detach = f_minus_f_hat.detach()
             diff_loss = self.forward_diff_loss(
-                z=f_hat_predict_detach, target=f_minus_f_hat_detach
+                z=last_layer_cond, target=f_minus_f_hat_detach
             )
         # [3. unpad the seqlen dim, and then get logits]
         return x_BLC, diff_loss    # return logits BLV, V is vocab_size    

@@ -16,6 +16,7 @@ class DiffLoss(nn.Module):
     def __init__(
         self,
         in_channels,
+        cond_channels,
         img_size,
         num_sampling_steps,
         sampler="iddpm",
@@ -32,8 +33,9 @@ class DiffLoss(nn.Module):
         # )
         self.net = UNetModel(
                     image_size=img_size,
-                    in_channels=self.in_channels,
-                    out_channels=self.in_channels * 2,
+                    cond_channels=cond_channels,
+                    in_channels=in_channels,
+                    out_channels=in_channels * 2,
                     model_channels=64,
                     attention_resolutions=[4,2,1],
                     num_res_blocks=2,
