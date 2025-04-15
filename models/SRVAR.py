@@ -342,8 +342,8 @@ class SRVAR(nn.Module):
                 sampler='iddpm',
             )
     
-    def forward_diff_loss(self, z, target, mask=None):
-        loss = self.diffloss(z=z, target=target, mask=mask)
+    def forward_diff_loss(self, z, target, f_predict, mask=None):
+        loss = self.diffloss(z=z, target=target, f_predict = f_predict, mask=mask)
         return loss
     
     def compile_flex_attn(self):
@@ -771,7 +771,7 @@ class SRVAR(nn.Module):
             f_minus_f_hat = f_hat - f_hat_predict
             f_minus_f_hat_detach = f_minus_f_hat.detach()
             diff_loss = self.forward_diff_loss(
-                z=last_layer_cond, target=f_minus_f_hat_detach
+                z=last_layer_cond.detach(), target=f_minus_f_hat_detach, f_predict=f_hat_predict.detach()
             )
         # [3. unpad the seqlen dim, and then get logits]
         return x_BLC, diff_loss    # return logits BLV, V is vocab_size    

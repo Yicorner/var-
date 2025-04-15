@@ -814,7 +814,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None ,c=None, **kwargs):
+    def forward(self, x, timesteps=None ,c=None, f_predict = None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -828,7 +828,7 @@ class UNetModel(nn.Module):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
         c = self.condition_net(c)
-        x = x + c
+        x = x + f_predict + c
         for module in self.input_blocks:
             x = module(x, emb)
             

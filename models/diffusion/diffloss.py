@@ -55,14 +55,14 @@ class DiffLoss(nn.Module):
     def initialize_weights(self):
         self.net.initialize_weights()
 
-    def forward(self, target, z, mask=None):
+    def forward(self, target, z,f_predict, mask=None):
         t = torch.randint(
             0,
             self.use_diffusion.num_timesteps,
             (target.shape[0],),
             device=target.device,
         )
-        model_kwargs = dict(c=z)
+        model_kwargs = dict(c=z, f_predict=f_predict)
         loss_dict = self.use_diffusion.training_losses(
             self.net, target,  t, model_kwargs
         )
@@ -71,7 +71,7 @@ class DiffLoss(nn.Module):
             loss = (loss * mask).sum() / mask.sum()
         return loss.mean()
 
-    def sample(self, z, temperature=1.0, cfg=1.5, sampler=None):
+    def sample(self, z, f_predict, temperature=1.0, cfg=1.5, sampler=None):
         # diffusion loss sampling
         if not cfg == 1.0:
             noise = torch.randn(z.shape[0] // 2, self.in_channels).cuda()
@@ -80,7 +80,7 @@ class DiffLoss(nn.Module):
             sample_fn = self.net.forward_with_cfg
         else:
             noise = torch.randn(z.shape[0], self.in_channels, self.img_size, self.img_size).cuda()
-            model_kwargs = dict(c=z)
+            model_kwargs = dict(c=z, f_predict=f_predict)
             sample_fn = self.net.forward
 
         #noise = self.gen_diffusion.q_sample(x_start, 500, noise=noise)
