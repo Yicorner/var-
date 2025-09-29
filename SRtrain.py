@@ -53,6 +53,7 @@ def build_everything(args: arg_util.Args):
     )
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
     
+    # QUESTION: don't know why the batch_size is 1.5 times the args.batch_size
     ld_val = DataLoader(
         dataset_val, num_workers=0, pin_memory=True,
         batch_size=round(args.batch_size*1.5), sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
@@ -113,8 +114,8 @@ def build_everything(args: arg_util.Args):
     
     srvar_wo_ddp = args.compile_model(srvar_wo_ddp, args.tfast)
     srvar_ddp_ema = None
-    
     ddp_class = DDP if dist.initialized() else NullDDP # zero等于0的分支
+    dist.barrier() # ADDED：wait for all processes to finish initialization, see the init_sync in DDP
     srvar_ddp: DDP = ddp_class(srvar_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=args.dbg, broadcast_buffers=False)
     torch.cuda.synchronize()
 
@@ -228,8 +229,6 @@ def main_training():
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                     
                 local_out_ckpt = os.path.join(args.local_out_dir_path, f'ckpt-{ep+1}.pth')        
-                #if(ckpt_num % (args.ep // 25) == 0):
-
                 torch.save({
                 'epoch':    ep+1,
                 'iter':     0,

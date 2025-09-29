@@ -20,3 +20,6 @@ local_output*
 *.jpg
 *.png
 ckpt_save/
+local_output/
+local_output_wo_diffloss/
+vae_ch160v4096z32.pth

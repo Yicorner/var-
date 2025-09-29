@@ -183,8 +183,8 @@ class Args(Tap):
         g.manual_seed(self.seed * dist.get_world_size() + dist.get_rank())
         return g
     
-    dbg: bool = 'KEVIN_LOCAL' in os.environ       # only used when debug about unused param in DDP
     local_debug: bool = 'KEVIN_LOCAL' in os.environ
+    dbg: bool = 'KEVIN_LOCAL' in os.environ       # only used when debug about unused param in DDP
     dbg_nan: bool = False   # 'KEVIN_LOCAL' in os.environ
     
     def compile_model(self, m, fast):
@@ -301,11 +301,11 @@ def init_dist_and_get_args():
     # update args: bs and lr
     bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())
     args.batch_size = bs_per_gpu
-    args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size()
+    args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size() # bs为一轮的bs，原先的是附加上ac的bs
     args.workers = min(max(0, args.workers), args.batch_size)
     
     args.tlr = args.ac * args.tblr * args.glb_batch_size / 256
-    args.twde = args.twde or args.twd
+    args.twde = args.twde or args.twd 
     
     args.enable_checkpointing = None if args.enable_checkpointing in [False, 0, "0"] else args.enable_checkpointing
     args.enable_checkpointing = "full-block" if args.enable_checkpointing in [True, 1, "1"] else args.enable_checkpointing

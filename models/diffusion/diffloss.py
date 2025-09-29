@@ -22,8 +22,8 @@ class DiffLoss(nn.Module):
         sampler="iddpm",
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.img_size = img_size
+        self.in_channels = in_channels # 32
+        self.img_size = img_size # 16
         # self.net = SimpleMLPAdaLN(
         #     in_channels=target_channels,
         #     model_channels=width,
@@ -43,7 +43,7 @@ class DiffLoss(nn.Module):
                     num_head_channels=8,
         )
 
-        self.num_sampling_steps = num_sampling_steps
+        self.num_sampling_steps = num_sampling_steps # '10'
         self.sampler = sampler
 
         self.use_diffusion = create_diffusion(

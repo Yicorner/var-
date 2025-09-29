@@ -1,5 +1,6 @@
 """
 Definitions of blocks of VAR transformer model.
+reference: infinity
 """
 
 import math
@@ -92,7 +93,7 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
     return rope2d_freqs_grid
 
 
-def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind):
+def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind): # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
     qk = torch.stack((q, k), dim=0)  #(2, batch_size, heads, seq_len, head_dim)
     device_type = qk.device.type
     device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
@@ -355,7 +356,7 @@ class CrossAttention(nn.Module):
         if for_attn_pool:
             q = torch.empty(1, self.num_heads, self.head_dim)
             nn.init.trunc_normal_(q, mean=0, std=math.sqrt(1 / embed_dim / 3))
-            self.mat_q = nn.Parameter(q)
+            self.mat_q = nn.Parameter(q) 
         else:
             self.mat_q = nn.Linear(embed_dim, embed_dim, bias=True)
         self.mat_kv = nn.Linear(kv_dim, embed_dim*2, bias=False)
@@ -382,13 +383,13 @@ class CrossAttention(nn.Module):
         kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, bias=torch.cat((self.zero_k_bias, self.v_bias))).view(N, 2, self.num_heads, self.head_dim) # NC => N2Hc
         # attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens
         
-        if not self.for_attn_pool:
+        if not self.for_attn_pool: # False in self.low_proj_for_sos, True in SRVAR block loop
             B, Lq = q.shape[:2]
             q_compact = self.mat_q(q).view(-1, self.num_heads, self.head_dim)
-        else:
+        else: # True
             B = cu_seqlens_k.shape[0] - 1
             Lq = 1
-            q_compact = self.mat_q.repeat(B, 1, 1).to(dtype=kv_compact.dtype)
+            q_compact = self.mat_q.repeat(B, 1, 1).to(dtype=kv_compact.dtype) # mat_q torch.Size([1, 4, 256]), q_compact torch.Size([4, 4, 256])
         
         if self.cos_attn:   # always False
             scale_mul = self.scale_mul_1H1.clamp_max(self.max_scale_mul).exp()
@@ -397,19 +398,19 @@ class CrossAttention(nn.Module):
             k = F.normalize(k, dim=-1)
             kv_compact = torch.stack((k, v), dim=1)
         
-        q_compact = q_compact.contiguous()
-        kv_compact = kv_compact.contiguous()
+        q_compact = q_compact.contiguous() # torch.Size([4, 4, 256])
+        kv_compact = kv_compact.contiguous() # kv_compact torch.Size([2048, 2, 4, 256])
         
-        cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
+        cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device) # tensor([0, 1, 2, 3, 4], device='cuda:0', dtype=torch.int32)
         if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), 
-                                                  kv=kv_compact.to(dtype=torch.bfloat16), 
-                                                  cu_seqlens_q=cu_seqlens_q, 
-                                                  cu_seqlens_k=cu_seqlens_k, 
-                                                  max_seqlen_q=Lq, 
-                                                  max_seqlen_k=max_seqlen_k, 
-                                                  dropout_p=0, 
-                                                  softmax_scale=self.scale)
+            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), # torch.Size([4, 4, 256])
+                                                  kv=kv_compact.to(dtype=torch.bfloat16), # kv_compact torch.Size([2048, 2, 4, 256])
+                                                  cu_seqlens_q=cu_seqlens_q, # tensor([0, 1, 2, 3, 4]
+                                                  cu_seqlens_k=cu_seqlens_k, # tensor([   0,  512, 1024, 1536, 2048], device='cuda:0', dtype=torch.int32)
+                                                  max_seqlen_q=Lq, # 1
+                                                  max_seqlen_k=max_seqlen_k, # tensor(512, device='cuda:0', dtype=torch.int32)
+                                                  dropout_p=0, # 0
+                                                  softmax_scale=self.scale) # 0.0625
             oup = oup.reshape(B, Lq, -1)
             oup = oup.float()
         else:
@@ -516,12 +517,12 @@ class CrossAttnBlock(nn.Module):
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
         
         if self.fused_norm_func is None:
-            x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1)
+            x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1) # torch.Size([4, 680, 1024])
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
-            x = x + self.drop_path(x_sa.mul_(gamma1))
+            x = x + self.drop_path(x_sa.mul_(gamma1)) # torch.Size([4, 680, 1024])
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         else:

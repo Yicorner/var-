@@ -135,13 +135,13 @@ class SRVARTrainer(object):
         self.srvar.require_backward_grad_sync = stepping
         
         # forward
-        B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
+        B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size # B: batch size 4, V: vocabulary size 4096
         
         gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
-        gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
-        x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
+        gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1) # 1 + 4 + 9 + 16 + 25 + 36 + 64 + 100 + 169 + 256 = 680
+        x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super) # torch.Size([4, 679, 32])
         
-        h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
+        h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1] # 看不懂
         T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
         h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
         h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
@@ -149,21 +149,21 @@ class SRVARTrainer(object):
         scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
         
         with self.var_opt.amp_ctx:
-            self.srvar_wo_ddp.forward
+            self.srvar_wo_ddp.forward 
             logits_BLV, diff_loss = self.srvar(inp_B3HW_low = inp_B3HW_low, \
                                                x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
                                                 ref_B3HW = ref_B3HW, \
                                                scale_schedule = scale_schedule, \
                                                f_hat = f_hat_super, \
                                                vae_local=self.vae_local)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL_super.view(-1)).view(B, -1)
+            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL_super.view(-1)).view(B, -1) # torch.Size([4, 680])
             if prog_si >= 0:    # in progressive training
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL_super.shape[1] == ed
                 lw = self.loss_weight[:, :ed].clone()
                 lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
             else:               # not in progressive training
-                lw = self.loss_weight
+                lw = self.loss_weight # torch.Size([1, 680])
             loss = loss.mul(lw).sum(dim=-1).mean() + diff_loss * 2.0  
         
         # backward
@@ -172,12 +172,12 @@ class SRVARTrainer(object):
         # log
         pred_BL = logits_BLV.data.argmax(dim=-1)
         if it == 0 or it in metric_lg.log_iters:
-            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)).item()
-            acc_mean = (pred_BL == gt_BL_super).float().mean().item() * 100
+            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)).item() # float
+            acc_mean = (pred_BL == gt_BL_super).float().mean().item() * 100 # int
             if prog_si >= 0:    # in progressive training
                 Ltail = acc_tail = -1
             else:               # not in progressive training
-                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)).item()
+                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)).item() # self.last_l = 256
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL_super[:, -self.last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm, 

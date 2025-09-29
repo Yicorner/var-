@@ -47,7 +47,7 @@ class TextAttentivePool(nn.Module):
         print(f"TextAttentivePool: Ct5={Ct5}, D={D}, head_dim={self.head_dim}")
         self.num_heads = Ct5 // self.head_dim
         self.ca = CrossAttention(for_attn_pool=True, embed_dim=self.D, kv_dim=Ct5, num_heads=self.num_heads)
-    def forward(self, ca_kv):
+    def forward(self, ca_kv): 
         return self.ca(None, ca_kv).squeeze(1)
 
 class SharedAdaLin(nn.Linear):
@@ -451,9 +451,9 @@ class SRVAR(nn.Module):
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
         
-        low_f = self.quant_conv(self.encoder(inp_B3HW_low))
-        low_f = low_f.permute(0, 2, 3, 1)
-        low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+        low_f = self.quant_conv(self.encoder(inp_B3HW_low)) # torch.Size([1, 32, 16, 16])
+        low_f = low_f.permute(0, 2, 3, 1) # torch.Size([1, 16, 16, 32])
+        low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3]) # B=36 torch.Size([1, 256, 32])
         
         if self.use_ref:
             ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
@@ -462,19 +462,19 @@ class SRVAR(nn.Module):
             low_f = torch.cat((low_f, ref_f), dim=1)
 
         # [3,679,32]
-        lowLen, lowC = low_f.shape[1], low_f.shape[2]
+        lowLen, lowC = low_f.shape[1], low_f.shape[2] # lowLen = 256, lowC = 32
         lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=inp_B3HW_low.device)  # 每个句子的 token 长度
-        max_seqlen_k = lens.max().to(device=inp_B3HW_low.device)  # 5
+        max_seqlen_k = lens.max().to(device=inp_B3HW_low.device)  # 256
         cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=inp_B3HW_low.device), lens]), dim=0).to(device=inp_B3HW_low.device).to(dtype = torch.int32)
         
-        kv_compact = low_f
+        kv_compact = low_f # torch.Size([1, 256, 32])
         
         if(len(kv_compact.shape) == 3): # B L C -> B*L C
-            kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])
+            kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])# torch.Size([256, 32])
 
-        bs = B
-        kv_compact = self.low_norm(kv_compact)
-        sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
+        bs = B # 1
+        kv_compact = self.low_norm(kv_compact) # torch.Size([256, 32])
+        sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [1, 1024]
         
         kv_compact = self.low_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
@@ -485,8 +485,8 @@ class SRVAR(nn.Module):
             
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list = []
-        accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
-        num_stages_minus_1 = len(scale_schedule)-1
+        accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1]) # torch.Size([1, 32, 16, 16])
+        num_stages_minus_1 = len(scale_schedule)-1 # 9
 
         need_to_pad = 0
         attn_fn = None
@@ -506,11 +506,11 @@ class SRVAR(nn.Module):
 
             BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
                                                         ca_kv = ca_kv, scale_schedule=scale_schedule, \
-                                                        B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True)
+                                                        B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True) # torch.Size([1, 1, 1024])
             if si == num_stages_minus_1:
                 last_layer_cond = BlV
                 last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
-            logits_BlV = self.get_logits(BlV[:B], cond_BD[:B])  
+            logits_BlV = self.get_logits(BlV[:B], cond_BD[:B])  # torch.Size([1, 1, 4096])
             if beam_search_nums >= 0 :
 
                 probs = F.softmax(logits_BlV, dim=-1)
@@ -577,10 +577,10 @@ class SRVAR(nn.Module):
 
                     idx_Bl = beam_find_best_idx_Bl
             else :
-                idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0]
+                idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0] # torch.Size([1, 1])
             
-            h_BChw = vae.quantize.embedding(idx_Bl).float()   # BlC
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
+            h_BChw = vae.quantize.embedding(idx_Bl).float()   # torch.Size([1, 1, 32])
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2]) # torch.Size([1, 32, 2, 2])
             
             ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
             idx_Bl_list.append(idx_Bl)
@@ -603,10 +603,12 @@ class SRVAR(nn.Module):
             return ret, idx_Bl_list, []
         
         if self.use_diff:
+            # Calculate f_hat_predict from the generated idx_Bl_list
+            f_hat_predict = vae.idxBl_to_fhat(idx_Bl_list)
             f_hat_diffusion = self.diffloss.sample(
-                    z=last_layer_cond, temperature=1.0,  cfg=1.0
+                    z=last_layer_cond, f_predict=f_hat_predict, temperature=1.0,  cfg=1.0
                 )
-            accu_BChw = f_hat_diffusion + accu_BChw 
+            accu_BChw = f_hat_diffusion + accu_BChw
 
         img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
@@ -652,31 +654,31 @@ class SRVAR(nn.Module):
         # if cfg_infer:
         #     return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
 
-        B = x_BLC_wo_prefix.shape[0]
+        B = x_BLC_wo_prefix.shape[0] # 4
 
-        x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
+        x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32 torch.Size([4, 679, 32])
         
         # [1. get input sequence x_BLC]
         with torch.amp.autocast('cuda', enabled=False):
-            low_f = self.quant_conv(self.encoder(inp_B3HW_low))
-            low_f = low_f.permute(0, 2, 3, 1)
-            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# B=36
+            low_f = self.quant_conv(self.encoder(inp_B3HW_low)) # torch.Size([4, 32, 16, 16])
+            low_f = low_f.permute(0, 2, 3, 1) # torch.Size([4, 16, 16, 32])
+            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# torch.Size([4, 256, 32])
             
             if self.use_ref:
-                ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
-                ref_f = ref_f.permute(0, 2, 3, 1)
-                ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# B=36
-                low_f = torch.cat((low_f, ref_f), dim=1)
+                ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW)) # torch.Size([4, 32, 16, 16])
+                ref_f = ref_f.permute(0, 2, 3, 1) # torch.Size([4, 16, 16, 32]) 
+                ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# torch.Size([4, 256, 32])
+                low_f = torch.cat((low_f, ref_f), dim=1) # torch.Size([4, 512, 32])
 
             # [3,679,32]
             lowLen, lowC = low_f.shape[1], low_f.shape[2]
-            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLC_wo_prefix.device)  # 每个句子的 token 长度
-            max_seqlen_k = lens.max().to(device=x_BLC_wo_prefix.device)  # 5
+            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLC_wo_prefix.device)  # 每个句子的 token 长度 torch.Size([4])
+            max_seqlen_k = lens.max().to(device=x_BLC_wo_prefix.device)  # 512
             cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLC_wo_prefix.device), lens]), dim=0).to(device=x_BLC_wo_prefix.device).to(dtype = torch.int32)
             
-            kv_compact = low_f
+            kv_compact = low_f # torch.Size([4, 512, 32])
             if(len(kv_compact.shape) == 3): # B L C -> B*L C
-                kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])
+                kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1]) # torch.Size([4*512, 32])
             # drop cond
             total = 0
             if not cfg_infer:
@@ -685,19 +687,19 @@ class SRVAR(nn.Module):
                         kv_compact[total:total+le] = self.cfg_uncond[:le]
                     total += le
             must_on_graph = self.cfg_uncond[0, 0] * 0
-            kv_compact = self.low_norm(kv_compact).contiguous()
-            sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32
-            kv_compact = self.low_proj_for_ca(kv_compact).contiguous()
+            kv_compact = self.low_norm(kv_compact).contiguous() # torch.Size([2048, 32])
+            sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32 torch.Size([4, 1024])
+            kv_compact = self.low_proj_for_ca(kv_compact).contiguous() # torch.Size([2048, 1024])
             kv_compact[0, 0] += must_on_graph
             ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
             
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32 torch.Size([4, 1024])
         
             # with open('log.txt', 'a') as f:
             #     f.write(f'sos:{sos.unsqueeze(1).expand(B, 1, -1)}\n')
             #     f.write(f'sos:{self.pos_start.expand(B, 1, -1)}\n')        
-            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
-            x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
+            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1) # torch.Size([4, 1, 1024])
+            x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1) # torch.Size([4, 680, 1024])
             
             # [1.1. pad the seqlen dim]
             l_end = x_BLC.shape[1]
@@ -705,26 +707,27 @@ class SRVAR(nn.Module):
                  
 
                 
-            if self.use_flex_attn:
+            if self.use_flex_attn: # False
                 if need_to_pad:
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 assert x_BLC.shape[-1] % 128 == 0, 'x_BLC.shape[-1] % 128 != 0'
                 attn_bias_or_two_vector = None
-            else:
+            else: # True
                 d: torch.Tensor = torch.cat([torch.full((pn[0]*pn[1]*pn[2],), i) for i, pn in enumerate(scale_schedule)]).view(1, l_end, 1)
                 dT = d.transpose(1, 2)    # dT: 11L
                 attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, l_end, l_end)
                 attn_bias = attn_bias_for_masking[:, :, :l_end, :l_end].contiguous()   # attn_bias: 11LL
-                if need_to_pad:
+                if need_to_pad: # False
                     attn_bias = F.pad(attn_bias, (0, need_to_pad, 0, need_to_pad), value=-torch.inf)
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
         
-        if self.use_flex_attn:
+        if self.use_flex_attn: # False
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
-        else:
+        else: # True
             attn_fn = None
+        
         # [2. block loop]
         SelfAttnBlock.forward, CrossAttnBlock.forward
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
@@ -755,12 +758,12 @@ class SRVAR(nn.Module):
             start = sum([pn[0]*pn[1]*pn[2] for pn in scale_schedule[:-1]])
             last_layer_cond = x_BLC[:, start: , :]
             last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
-        x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD)
+        x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD) # torch.Size([4, 680, 4096])
         diff_loss = 0.0
 
         if self.use_diff:
-            idx_Bl = x_BLC.argmax(dim=-1)
-            idx_Bl_list = []
+            idx_Bl = x_BLC.argmax(dim=-1) # torch.Size([4, 680])
+            idx_Bl_list = [] 
             curL = 0
             for scale in scale_schedule:
                 curL_next = curL + np.prod(scale)
@@ -810,7 +813,7 @@ class SRVAR(nn.Module):
                 self.head[-1].bias.data.zero_()
         
         depth = len(self.unregistered_blocks)
-        for block_idx, sab in enumerate(self.unregistered_blocks):
+        for block_idx, sab in enumerate(self.unregistered_blocks): 
             sab: Union[SelfAttnBlock, CrossAttnBlock]
             # init proj
             scale = 1 / math.sqrt(2*depth if scale_proj == 1 else 2*(1 + block_idx))

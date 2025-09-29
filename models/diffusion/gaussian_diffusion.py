@@ -778,7 +778,7 @@ class GaussianDiffusion:
             model_output = model(x_t, t, **model_kwargs)
 
             if self.model_var_type in [
-                ModelVarType.LEARNED,
+                ModelVarType.LEARNED,   
                 ModelVarType.LEARNED_RANGE,
             ]:
                 B, C = x_t.shape[:2]
