@@ -52,38 +52,38 @@ class VectorQuantizer2(nn.Module):
     def forward(self, f_BChw: torch.Tensor, ret_usages=False) -> Tuple[torch.Tensor, List[float], torch.Tensor]:
         dtype = f_BChw.dtype
         if dtype != torch.float32: f_BChw = f_BChw.float()
-        B, C, H, W = f_BChw.shape
-        f_no_grad = f_BChw.detach()
+        B, C, H, W = f_BChw.shape             # B=batch, C=embed_dim, H,W=feature spatial
+        f_no_grad = f_BChw.detach()            # [B, C, H, W]
         
-        f_rest = f_no_grad.clone()
-        f_hat = torch.zeros_like(f_rest)
+        f_rest = f_no_grad.clone()             # [B, C, H, W]
+        f_hat = torch.zeros_like(f_rest)       # [B, C, H, W]
         
         with torch.cuda.amp.autocast(enabled=False):
-            mean_vq_loss: torch.Tensor = 0.0
-            vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=f_BChw.device)
-            SN = len(self.v_patch_nums)
-            for si, pn in enumerate(self.v_patch_nums): # from small to large
+            mean_vq_loss: torch.Tensor = 0.0   # scalar
+            vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=f_BChw.device)  # [V]
+            SN = len(self.v_patch_nums)        # number of scales
+            for si, pn in enumerate(self.v_patch_nums): # from small to large; pn=patch size at scale si
                 # find the nearest embedding
                 if self.using_znorm:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-                    rest_NC = F.normalize(rest_NC, dim=-1)
-                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)
+                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)  # [(B*pn*pn), C] or [(B*H*W), C]
+                    rest_NC = F.normalize(rest_NC, dim=-1)  # same shape as above
+                    idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)  # [(B*pn*pn)] or [(B*H*W)]
                 else:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-                    d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
-                    d_no_grad.addmm_(rest_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
-                    idx_N = torch.argmin(d_no_grad, dim=1)
+                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)  # [(B*pn*pn), C] or [(B*H*W), C]
+                    d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)  # [(B*pn*pn), 1] or [(B*H*W), 1] + [V]
+                    d_no_grad.addmm_(rest_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # [(B*h*w), V]
+                    idx_N = torch.argmin(d_no_grad, dim=1)  # [(B*pn*pn)] or [(B*H*W)]
                 
-                hit_V = idx_N.bincount(minlength=self.vocab_size).float()
+                hit_V = idx_N.bincount(minlength=self.vocab_size).float()  # [V]
                 if self.training:
                     if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # calc loss
-                idx_Bhw = idx_N.view(B, pn, pn)
-                h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
-                f_hat = f_hat + h_BChw
-                f_rest -= h_BChw
+                idx_Bhw = idx_N.view(B, pn, pn)  # [B, pn, pn]
+                h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)  # [B, C, H, W]
+                f_hat = f_hat + h_BChw              # [B, C, H, W]
+                f_rest -= h_BChw                    # [B, C, H, W]
                 
                 if self.training and dist.initialized():
                     handler.wait()
@@ -91,17 +91,17 @@ class VectorQuantizer2(nn.Module):
                     elif self.record_hit < 100: self.ema_vocab_hit_SV[si].mul_(0.9).add_(hit_V.mul(0.1))
                     else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01))
                     self.record_hit += 1
-                vocab_hit_V.add_(hit_V)
-                mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
+                vocab_hit_V.add_(hit_V)             # [V]
+                mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)  # scalar
             
-            mean_vq_loss *= 1. / SN
-            f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
+            mean_vq_loss *= 1. / SN              # scalar
+            f_hat = (f_hat.data - f_no_grad).add_(f_BChw)  # [B, C, H, W]
         
-        margin = tdist.get_world_size() * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08
+        margin = tdist.get_world_size() * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08  # float scalar
         # margin = pn*pn / 100
-        if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
-        else: usages = None
-        return f_hat, usages, mean_vq_loss
+        if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]  # list[float] len=SN
+        else: usages = None  # or list[float] | None
+        return f_hat, usages, mean_vq_loss  # ([B, C, H, W], list[float]|None, scalar)
     # ===================== `forward` is only used in VAE training =====================
     
     def embed_to_fhat(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale=True, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
