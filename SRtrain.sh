@@ -2,7 +2,7 @@ export CUDA_VISIBLE_DEVICES=0
 torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12346 SRtrain.py  \
 --bs=4 --ep=50 \
 --tblr=0.0003 \
---alng=1e-3 --wpe=0.1 --data_path=/home/why/qbh/dataset/brats_256_t2_2021_pair_png_with_ref \
+--alng=1e-3 --wpe=0.1 --data_path=/home/featurize/work/brats_256_t2_2021_pair_png_with_ref_small \
 --pn="1M" \
 --rope2d_normalized_by_hw=2 --rope2d_each_sa_layer=1 \
 --enable_checkpointing="full-block" \
