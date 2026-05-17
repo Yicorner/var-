@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from functools import partial
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -19,7 +20,7 @@ from utils.misc import auto_resume
 import math
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from models import SRVAR, VQVAE, build_vae_srvar
+from models import SRVAR, VQVAE, build_vae_srvar, build_lr_vae, LR_VAE
 from SRtrainer import SRVARTrainer
 from utils.amp_sc import AmpOptimizer
 from utils.lr_control import filter_params
@@ -48,8 +49,18 @@ def build_everything(args: arg_util.Args):
     
     # =============== build dataset ===============
     print(f'[build PT data] ...\n')
+    # Validate LR-condition switch matrix early; see SKILL: var-lr-data-conventions.
+    if args.lr_cond_source == 'lr_vae':
+        assert args.lr_folder in ('LR_64x64',), (
+            f'lr_cond_source=lr_vae requires lr_folder=LR_64x64 (LR_VAE expects 64x64 input); '
+            f'got lr_folder={args.lr_folder!r}'
+        )
+        assert args.stage1_ckpt, (
+            f'lr_cond_source=lr_vae requires --stage1_ckpt to be non-empty.'
+        )
     dataset_train, dataset_val = build_dataset(
-        args.data_path, augment=True, use_ref=args.use_ref
+        args.data_path, augment=True, use_ref=args.use_ref,
+        lr_folder=args.lr_folder, hr_folder=args.hr_folder, same_shape=args.same_shape,
     )
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
     
@@ -83,20 +94,63 @@ def build_everything(args: arg_util.Args):
     # =============== build model ===============
     vae_local, srvar_wo_ddp = build_vae_srvar(
         args,
-        device = dist.get_device(),
-        patch_nums=args.patch_nums,   # 10 steps by default
-    # VQVAE args
-        V=args.vocab_size, Cvae=args.Ct5, ch=160, share_quant_resi=4,
-        )
+        device=dist.get_device(),
+        patch_nums=args.patch_nums,
+        V=args.vocab_size, Cvae=args.Ct5, ch=args.vae_ch,
+        share_quant_resi=args.share_quant_resi,
+    )
 
+    assert args.vae_ckpt, '--vae_ckpt must be provided (myvaex stage2 ckpt path).'
     vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
-    if "trainer" in vae_ckpt.keys():
-        vae_ckpt = vae_ckpt["trainer"]["vae_ema"]    
+    if isinstance(vae_ckpt, dict) and "trainer" in vae_ckpt.keys():
+        # Try in priority order: vae_ema -> vae_wo_ddp -> vae -> first vae-like key.
+        trainer_blob = vae_ckpt["trainer"]
+        for key in ("vae_ema", "vae_wo_ddp", "vae"):
+            if key in trainer_blob:
+                vae_ckpt = trainer_blob[key]
+                print(f"[vae_ckpt] using trainer['{key}']")
+                break
+        else:
+            raise KeyError(f"vae_ckpt['trainer'] has no vae_ema/vae_wo_ddp/vae; keys={list(trainer_blob)}")
     vae_local.load_state_dict(vae_ckpt, strict=True)
     print(f"loaded vae from {args.vae_ckpt}")
-    
+
+    # Sanity: patch_nums in ckpt and args must agree (already encoded in tensor shapes
+    # of quant_resi/mean_logvar_conv, so strict=True above would have failed otherwise).
+    assert tuple(vae_local.quantize.v_patch_nums) == tuple(args.patch_nums), (
+        f'patch_nums mismatch: ckpt={vae_local.quantize.v_patch_nums} vs args={args.patch_nums}'
+    )
+
+    # Optional stage1 LR_VAE.
+    lr_vae_local: Optional[LR_VAE] = None
+    if args.stage1_ckpt:
+        lr_vae_local = build_lr_vae(args, dist.get_device(), Cvae=args.Ct5, ch=args.vae_ch)
+        lr_ckpt = torch.load(args.stage1_ckpt, map_location='cpu')
+        if isinstance(lr_ckpt, dict) and 'trainer' in lr_ckpt:
+            blob = lr_ckpt['trainer']
+            for key in ('lr_vae_ema', 'lr_vae_wo_ddp', 'lr_vae'):
+                if key in blob:
+                    lr_ckpt = blob[key]
+                    print(f"[stage1_ckpt] using trainer['{key}']")
+                    break
+            else:
+                raise KeyError(f"stage1_ckpt['trainer'] has no lr_vae_ema/lr_vae_wo_ddp/lr_vae; keys={list(blob)}")
+        lr_vae_local.load_state_dict(lr_ckpt, strict=False)
+        print(f"[stage1_ckpt] loaded LR_VAE from {args.stage1_ckpt}")
+
+        # Validate scale[0] dimension agreement.
+        if dist.is_master():
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 64, 64, device=dist.get_device())
+                lr_mean = lr_vae_local.encode_to_posterior_mean(dummy)
+                pn0 = args.patch_nums[0]
+                assert lr_mean.shape[-1] == pn0, (
+                    f'patch_nums[0]={pn0} must equal LR_VAE latent edge {lr_mean.shape[-1]} '
+                    f'when stage1_ckpt is enabled.'
+                )
+
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    
+
     if args.tini < 0:
         args.tini = math.sqrt(1 / srvar_wo_ddp.C / 3)
     srvar_wo_ddp.init_weights(other_std=args.tini)
@@ -150,17 +204,22 @@ def build_everything(args: arg_util.Args):
     srvar_optim = AmpOptimizer('srvar', args.fp16, opt_clz(params=para_groups, **opt_kw), srvar_wo_ddp, args.r_accu, args.tclip, args.zero)
     del names, paras, para_groups
     
-    # return vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim, tb_lg, start_ep, start_it, iters_train, ld_train, ld_val, trainer_state
     # build trainer
     trainer = SRVARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
         vae_local=vae_local, srvar_wo_ddp=srvar_wo_ddp, srvar=srvar_ddp,
-        var_opt=srvar_optim, label_smooth=args.ls, use_are_loss_weight = args.use_are_loss_weight
+        var_opt=srvar_optim, label_smooth=args.ls,
+        use_are_loss_weight=args.use_are_loss_weight,
+        lr_vae=lr_vae_local,
+        lr_cond_source=args.lr_cond_source,
+        skip_scale0_loss=args.skip_scale0_loss,
+        diffloss_batch_mul=args.diffloss_batch_mul,
+        args=args,
     )
     if trainer_state is not None and len(trainer_state):
-        trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
-        
-    del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim
+        trainer.load_state_dict(trainer_state, strict=False, skip_vae=True)
+
+    del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim, lr_vae_local
     
     dist.barrier()
     return (
@@ -181,40 +240,50 @@ def main_training():
     
     # train
     start_time = time.time()
-    best_L_mean, best_L_tail, best_acc_mean, best_acc_tail = 999., 999., -1., -1.
-    best_val_loss_mean, best_val_loss_tail, best_val_acc_mean, best_val_acc_tail = 999, 999, -1, -1
-    
-    L_mean, L_tail = -1, -1
+    best_train_loss = 1e9
+    best_val_loss = 1e9
+    best_val_psnr = -1.0
+    best_val_ssim = -1.0
+
+    train_loss = -1.0
     for ep in range(start_ep, args.ep):
         if hasattr(ld_train, 'sampler') and hasattr(ld_train.sampler, 'set_epoch'):
             ld_train.sampler.set_epoch(ep)
             if ep < 3:
-                # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
-        
+
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
         )
-        
-        L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
-        best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
-        if L_tail != -1: best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
-        args.L_mean, args.L_tail, args.acc_mean, args.acc_tail, args.grad_norm = L_mean, L_tail, acc_mean, acc_tail, grad_norm
+
+        train_loss = stats.get('Ld', -1.0)
+        grad_norm = stats.get('tnm', -1.0)
+        best_train_loss = min(best_train_loss, train_loss)
+        args.L_mean, args.grad_norm = train_loss, grad_norm
         args.cur_ep = f'{ep+1}/{args.ep}'
         args.remain_time, args.finish_time = remain_time, finish_time
-        
-        AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
+
+        AR_ep_loss = dict(train_diff_loss=train_loss)
         is_val_and_also_saving = (ep + 1) % args.val_and_saving_per_ep == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
-            val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, val_diff_loss, tot, cost = trainer.eval_ep(ld_val, use_ref=args.use_ref)
-            best_updated = best_val_loss_mean > val_loss_mean
-            best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
-            best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)
-            AR_ep_loss.update(vL_mean=val_loss_mean, vL_tail=val_loss_tail, vacc_mean=val_acc_mean, vacc_tail=val_acc_tail)
-            args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
-            print(f' [*] [ep{ep}]  (val {tot})  Lm: {val_loss_mean:.4f}, Lt: {val_loss_tail:.4f}, Acc m&t: {val_acc_mean:.2f} {val_acc_tail:.2f}, val diff_loss: {val_diff_loss:.2f}  Val cost: {cost:.2f}s')
-            
+            val_diff_loss, val_psnr, val_ssim, tot, cost = trainer.eval_ep(
+                ld_val, use_ref=args.use_ref,
+                eval_ar_max_batches=args.eval_ar_max_batches,
+                cfg_infer_scale=args.cfg_infer,
+            )
+            best_updated = val_diff_loss < best_val_loss
+            best_val_loss = min(best_val_loss, val_diff_loss)
+            best_val_psnr = max(best_val_psnr, val_psnr)
+            best_val_ssim = max(best_val_ssim, val_ssim)
+            AR_ep_loss.update(val_diff_loss=val_diff_loss, val_psnr=val_psnr, val_ssim=val_ssim)
+            args.vL_mean, args.vacc_mean = val_diff_loss, val_psnr
+            print(
+                f' [*] [ep{ep}]  (val {tot})  '
+                f'val_diff_loss: {val_diff_loss:.4f}, val_PSNR: {val_psnr:.2f}, val_SSIM: {val_ssim:.4f}  '
+                f'Val cost: {cost:.2f}s'
+            )
+
             if dist.is_local_master():
                 local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
                 local_out_ckpt_best = os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth')
@@ -239,14 +308,22 @@ def main_training():
                     
             dist.barrier()
         
-        print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
-        tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
-        tb_lg.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
-        args.dump_log(); tb_lg.flush()
-    
+        print(
+            f'     [ep{ep}]  (training)  diff_loss: {best_train_loss:.4f} ({train_loss:.4f}),  '
+            f'best_val_PSNR: {best_val_psnr:.2f},  best_val_SSIM: {best_val_ssim:.4f},  '
+            f'Remain: {remain_time},  Finish: {finish_time}',
+            flush=True,
+        )
+        tb_lg.update(head='AR_ep_loss', step=ep + 1, **AR_ep_loss)
+        tb_lg.update(head='AR_z_burnout', step=ep + 1, rest_hours=round(sec / 60 / 60, 2))
+        args.dump_log()
+        tb_lg.flush()
+
     total_time = f'{(time.time() - start_time) / 60 / 60:.1f}h'
     print('\n\n')
-    print(f'  [*] [PT finished]  Total cost: {total_time},   Lm: {best_L_mean:.3f} ({L_mean}),   Lt: {best_L_tail:.3f} ({L_tail})')
+    print(f'  [*] [PT finished]  Total cost: {total_time},   '
+          f'best diff_loss: {best_train_loss:.4f} (last {train_loss:.4f}),   '
+          f'best val PSNR/SSIM: {best_val_psnr:.2f}/{best_val_ssim:.4f}')
     print('\n\n')
     
     del stats
@@ -268,8 +345,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     me = misc.MetricLogger(delimiter='  ')
     me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
     me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    [me.add_meter(x, misc.SmoothedValue(fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
-    [me.add_meter(x, misc.SmoothedValue(fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accm', 'Acct']]
+    me.add_meter('Ld', misc.SmoothedValue(fmt='{median:.4f} ({global_avg:.4f})'))
     header = f'[Ep]: [{ep:4d}/{args.ep}]'
     
     if is_first_ep:
@@ -277,7 +353,8 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
-    for it, datas in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    log_points = max(1, int(getattr(args, 'train_log_points_per_epoch', 8)))
+    for it, datas in me.log_every(start_it, iters_train, ld_or_itrt, log_points, header):
         if args.use_ref:
             low, super, ref = datas
         else :

@@ -87,12 +87,12 @@ class SRVAR(nn.Module):
         embed_dim=1024, depth=16, num_heads=16, mlp_ratio=4.,   # model's architecture
         drop_rate=0., drop_path_rate=0.,    # drop out and drop path
         norm_eps=1e-6, rms_norm=False,      # norm layer
-        shared_aln=False, head_aln=True,    # adaptive norm
+        shared_aln=False, head_aln=True,    # adaptive norm (head_aln kept for ckpt compat, ignored)
         cond_drop_rate=0.1,                 # for classifier-free guidance
         rand_uncond=False,
         cross_attn_layer_scale=-1., nm0=False, tau=1, cos_attn=True, swiglu=False,
         raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
-        head_depth=1,
+        head_depth=1,                       # kept for ckpt compat; new continuous head doesn't use it
         top_p=0.0, top_k=0.0,
         customized_flash_attn=False, fused_mlp=False, fused_norm=False,
         block_chunks=1,
@@ -107,10 +107,16 @@ class SRVAR(nn.Module):
         train_h_div_w_list=None,
         video_frames=1,
         always_training_scales=20,
-        apply_spatial_patchify = 0,
+        apply_spatial_patchify=0,
         inference_mode=False,
-        use_ref = False,
-        use_diff = False,
+        use_ref=False,
+        # ---- continuous AR (MAR-style DiffLoss) ----
+        diffloss_w: int = 1024,
+        diffloss_d: int = 3,
+        diff_steps: str = "100",
+        diffloss_batch_mul: int = 4,
+        # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
+        lr_cond_source: str = 'srvar_encoder',
     ):
         
         # set hyperparameters
@@ -194,22 +200,45 @@ class SRVAR(nn.Module):
         assert round(t.sum().item()) in {0, dist.get_world_size()}, f'flash_fused_op_installed: {t}'
         
         super().__init__()
-        
+
+        # LR conditioning source. When 'srvar_encoder' we own the encoder/quant_conv
+        # (initialised from the frozen HR VAE via init_LREncoder). When 'lr_vae' the
+        # caller is responsible for running the (frozen) LR_VAE upstream and passing
+        # `low_f` directly into forward()/autoregressive_infer_cfg().
+        assert lr_cond_source in ('srvar_encoder', 'lr_vae'), \
+            f"lr_cond_source must be 'srvar_encoder' or 'lr_vae', got {lr_cond_source!r}"
+        self.lr_cond_source: str = lr_cond_source
+
         ddconfig = dict(
             dropout=vae_local.dropout, ch=vae_local.ch, z_channels=vae_local.Cvae,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
-            using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
-            # resamp_with_conv=True,   # always True, removed.
-        ) 
-        self.encoder = Encoder(double_z=False, **ddconfig)
-        self.quant_conv = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
+            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
+            using_sa=True, using_mid_sa=True,
+        )
+        if self.lr_cond_source == 'srvar_encoder':
+            self.encoder = Encoder(double_z=False, **ddconfig)
+            self.quant_conv = torch.nn.Conv2d(
+                vae_local.Cvae, vae_local.Cvae,
+                vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks // 2,
+            )
+        else:
+            # Skip building the local encoder; LR_VAE is fed in externally.
+            self.encoder = None
+            self.quant_conv = None
 
         self.use_ref = use_ref
         if use_ref:
+            assert self.lr_cond_source == 'srvar_encoder', \
+                'use_ref is only supported with lr_cond_source=srvar_encoder.'
             self.encoder_ref = Encoder(double_z=False, **ddconfig)
-            self.quant_conv_ref = torch.nn.Conv2d(vae_local.Cvae, vae_local.Cvae, vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks//2)
-        
-        self.use_diff = use_diff
+            self.quant_conv_ref = torch.nn.Conv2d(
+                vae_local.Cvae, vae_local.Cvae,
+                vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks // 2,
+            )
+
+        # Held for backward compat with existing checkpoints / metric.py wiring;
+        # new training path always uses the DiffLoss head below regardless.
+        self.use_diff = True
+        self.diffloss_batch_mul = int(max(1, diffloss_batch_mul))
 
         self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
@@ -308,14 +337,13 @@ class SRVAR(nn.Module):
             )
             self.unregistered_blocks.append(block)
         
-        # [head]
-        V = self.V
-        if head_aln:
-            self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=norm_layer, fused_norm_func=fused_norm_func)
-            self.head = nn.Linear(self.C, V) if head_depth == 1 else nn.Sequential(nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
-        else:
-            self.head_nm = MultiInpIdentity()
-            self.head = nn.Sequential(norm_layer(self.C), nn.Linear(self.C, V)) if head_depth == 1 else nn.Sequential(norm_layer(self.C), nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
+        # No discrete logits head: var now predicts continuous per-token vectors via
+        # the DiffLoss head below. We still construct a tiny AdaLN-before-head module
+        # to project the backbone output into the `z` space used as DiffLoss condition,
+        # because it preserves the existing CFG / AdaLN structure of the codebase.
+        self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=norm_layer, fused_norm_func=fused_norm_func)
+        # Linear C -> C: gives DiffLoss a dedicated projection without bloating params.
+        self.head = nn.Linear(self.C, self.C)
         
         self.num_block_chunks = block_chunks or 1
         self.num_blocks_in_a_chunk = depth // block_chunks
@@ -333,18 +361,17 @@ class SRVAR(nn.Module):
             f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
-        if self.use_diff:
-            self.diffloss = DiffLoss(
-                in_channels=vae_local.Cvae,
-                cond_channels=self.C,
-                img_size=16,
-                num_sampling_steps='10',
-                sampler='iddpm',
-            )
-    
-    def forward_diff_loss(self, z, target, f_predict, mask=None):
-        loss = self.diffloss(z=z, target=target, f_predict = f_predict, mask=mask)
-        return loss
+        # MAR-style per-token DiffLoss head.
+        # target_channels = Cvae   (continuous latent dim per token)
+        # z_channels      = self.C (DiffLoss condition dim, = embed_dim)
+        self.diffloss = DiffLoss(
+            target_channels=vae_local.Cvae,
+            z_channels=self.C,
+            depth=int(diffloss_d),
+            width=int(diffloss_w),
+            num_sampling_steps=str(diff_steps),
+            grad_checkpointing=(self.checkpointing == 'full-block'),
+        )
     
     def compile_flex_attn(self):
         
@@ -394,14 +421,45 @@ class SRVAR(nn.Module):
         return attn_fn_compile_dict
         
     def get_logits(self, h: torch.Tensor, cond_BD: Optional[torch.Tensor]):
-        """
-        :param h: hidden_state, shaped (B or batch_size, L or seq_len, C or hidden_dim)
-        :param cond_BD: shaped (B or batch_size, D or cond_dim)
-        :param tau: temperature
-        :return: logits, shaped (B or batch_size, V or vocabulary_size)
+        """Project transformer hidden state into the DiffLoss `z` condition space.
+
+        The name `get_logits` is kept for parity with the legacy codebase, but in the
+        continuous-AR head this no longer returns logits over a vocabulary; instead
+        it returns the per-token condition `z` of dimension `self.C`.
         """
         with torch.amp.autocast('cuda', enabled=False):
             return self.head(self.head_nm(h.float(), cond_BD.float()))
+
+    def _encode_lr_to_low_f(
+        self,
+        inp_B3HW_low: torch.Tensor,
+        ref_B3HW: Optional[torch.Tensor],
+        low_f_override: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Produce the `low_f` token sequence `[B, low_len, Cvae]` from LR input.
+
+        - With `lr_cond_source='srvar_encoder'`, run SRVAR's local encoder/quant_conv.
+        - With `lr_cond_source='lr_vae'`, the caller must pass `low_f_override`
+          (already `[B, low_len, Cvae]`, e.g. flattened `lr_vae.encode_to_posterior_mean(LR)`).
+        Optionally concat a reference image's tokens (only with srvar_encoder).
+        """
+        if self.lr_cond_source == 'lr_vae':
+            assert low_f_override is not None, \
+                'lr_cond_source=lr_vae requires the caller to pass `low_f_override`.'
+            assert low_f_override.dim() == 3, \
+                f'expected low_f_override [B,L,C], got {low_f_override.shape}'
+            return low_f_override
+
+        assert self.encoder is not None and self.quant_conv is not None
+        B = inp_B3HW_low.shape[0]
+        low_f = self.quant_conv(self.encoder(inp_B3HW_low))     # [B, C, h, w]
+        low_f = low_f.permute(0, 2, 3, 1).reshape(B, -1, low_f.shape[1])
+        if self.use_ref:
+            assert ref_B3HW is not None, 'use_ref=True but ref_B3HW=None.'
+            ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
+            ref_f = ref_f.permute(0, 2, 3, 1).reshape(B, -1, ref_f.shape[1])
+            low_f = torch.cat((low_f, ref_f), dim=1)
+        return low_f
     
     def get_scale_logits(self,
                    si,
@@ -435,186 +493,111 @@ class SRVAR(nn.Module):
     def autoregressive_infer_cfg(
         self,
         vae=None,
-        scale_schedule=None,
-        inp_B3HW_low = None,
-        ref_B3HW=None,
-        B=1, 
-        g_seed=None, 
-        returns_vemb=0, 
-        ret_img=False,              # 是否返回图片
-        trunk_scale=1000,           # 控制图片最大的大小，大于这个不生成了
-        beam_search_nums = 3,
+        scale_schedule: Optional[List[Tuple[int, int, int]]] = None,
+        inp_B3HW_low: Optional[torch.Tensor] = None,
+        ref_B3HW: Optional[torch.Tensor] = None,
+        low_f_override: Optional[torch.Tensor] = None,
+        B: int = 1,
+        g_seed: Optional[int] = None,
+        ret_img: bool = False,
+        trunk_scale: int = 1000,
+        temperature: float = 1.0,
+        cfg: float = 1.0,
+        return_fhat: bool = False,
+    ):
+        """Multi-scale autoregressive inference with continuous DiffLoss head.
 
-        choose_min = "max_2max",
-        score_compare = "max_2max",
-    ):   # returns List[idx_Bl]
-        if g_seed is None: rng = None
-        else: self.rng.manual_seed(g_seed); rng = self.rng
-        
-        low_f = self.quant_conv(self.encoder(inp_B3HW_low)) # torch.Size([1, 32, 16, 16])
-        low_f = low_f.permute(0, 2, 3, 1) # torch.Size([1, 16, 16, 32])
-        low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3]) # B=36 torch.Size([1, 256, 32])
-        
-        if self.use_ref:
-            ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW))
-            ref_f = ref_f.permute(0, 2, 3, 1)
-            ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# B=36
-            low_f = torch.cat((low_f, ref_f), dim=1)
+        For each scale `si`, the transformer produces a per-token condition `z`,
+        we call `self.diffloss.sample(z, temperature, cfg)` to sample the
+        continuous token, accumulate via `vae.quantize.get_next_autoregressive_input`,
+        and feed the next-scale teacher-forcing input back into the transformer.
 
-        # [3,679,32]
-        lowLen, lowC = low_f.shape[1], low_f.shape[2] # lowLen = 256, lowC = 32
-        lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=inp_B3HW_low.device)  # 每个句子的 token 长度
-        max_seqlen_k = lens.max().to(device=inp_B3HW_low.device)  # 256
-        cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=inp_B3HW_low.device), lens]), dim=0).to(device=inp_B3HW_low.device).to(dtype = torch.int32)
-        
-        kv_compact = low_f # torch.Size([1, 256, 32])
-        
-        if(len(kv_compact.shape) == 3): # B L C -> B*L C
-            kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1])# torch.Size([256, 32])
+        Returns one of:
+            (ret_list, []) if not `ret_img` and not `return_fhat`
+            (ret_list, []) where the second slot is `(accu_BChw,)` if `return_fhat`
+            (ret_list, [], img) if `ret_img`; img is `[B, H, W, 3]` uint8.
+        """
+        if g_seed is not None:
+            self.rng.manual_seed(g_seed)
 
-        bs = B # 1
-        kv_compact = self.low_norm(kv_compact) # torch.Size([256, 32])
-        sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [1, 1024]
-        
-        kv_compact = self.low_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
+        assert scale_schedule is not None and vae is not None
+
+        # ---- 1. LR conditioning ----
+        device = (
+            inp_B3HW_low.device if inp_B3HW_low is not None
+            else low_f_override.device
+        )
+        low_f = self._encode_lr_to_low_f(inp_B3HW_low, ref_B3HW, low_f_override)
+        lowLen = low_f.shape[1]
+        lens = torch.full((B,), lowLen, dtype=torch.int32, device=device)
+        max_seqlen_k = lens.max()
+        cu_seqlens_k = torch.cumsum(
+            torch.cat([torch.zeros(1, dtype=torch.int32, device=device), lens]), dim=0
+        ).to(dtype=torch.int32)
+
+        kv_compact = low_f.reshape(-1, low_f.shape[-1])
+        kv_compact = self.low_norm(kv_compact)
+        sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k))
+        kv_compact = self.low_proj_for_ca(kv_compact)
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
-            
-        accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
-        idx_Bl_list = []
-        accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1]) # torch.Size([1, 32, 16, 16])
-        num_stages_minus_1 = len(scale_schedule)-1 # 9
 
+        # ---- 2. AR loop ----
+        last_stage = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+        accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
+        num_stages_minus_1 = len(scale_schedule) - 1
         need_to_pad = 0
         attn_fn = None
 
-        if self.use_flex_attn:
-                attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
-
-        for b in self.unregistered_blocks: 
+        ret: List[torch.Tensor] = []
+        for b in self.unregistered_blocks:
             (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
 
-        for si, pn in enumerate(scale_schedule):   # si: i-th segment
-            if si >= trunk_scale:
-                break
-            num_pn = np.array(pn).prod()
-            cur_L += num_pn
-            nex_is = si+1
+        try:
+            for si, pn in enumerate(scale_schedule):
+                if si >= trunk_scale:
+                    break
+                pn_t, pn_h, pn_w = pn
+                num_pn = int(pn_t * pn_h * pn_w)
 
-            BlV = self.get_scale_logits(si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss, \
-                                                        ca_kv = ca_kv, scale_schedule=scale_schedule, \
-                                                        B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True) # torch.Size([1, 1, 1024])
-            if si == num_stages_minus_1:
-                last_layer_cond = BlV
-                last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
-            logits_BlV = self.get_logits(BlV[:B], cond_BD[:B])  # torch.Size([1, 1, 4096])
-            if beam_search_nums >= 0 :
+                # Transformer hidden state for this scale's tokens.
+                BlV = self.get_scale_logits(
+                    si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss,
+                    ca_kv=ca_kv, scale_schedule=scale_schedule,
+                    B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True,
+                )                                                       # [B, pn, D]
+                z_BlD = self.get_logits(BlV[:B], cond_BD[:B])           # [B, pn, D]
 
-                probs = F.softmax(logits_BlV, dim=-1)
-                value_Bl, idx_Bl = probs.max(dim=-1)
+                # Per-token DiffLoss sampling.
+                z_flat = z_BlD.reshape(-1, z_BlD.shape[-1]).contiguous() # [B*pn, D]
+                h_flat = self.diffloss.sample(z_flat, temperature=temperature, cfg=cfg)
+                h_BChw = h_flat.reshape(B, pn_h, pn_w, vae.Cvae).permute(0, 3, 1, 2).contiguous()
 
+                ret.append(h_BChw)
+
+                # Accumulate and prepare next-scale teacher-forcing input.
+                accu_BChw, last_stage_fhat = vae.quantize.get_next_autoregressive_input(
+                    si, len(self.raw_scale_schedule), accu_BChw, h_BChw,
+                )
                 if si != num_stages_minus_1:
+                    last_stage = last_stage_fhat.view(B, vae.Cvae, -1).transpose(1, 2)
+                    last_stage = self.word_embed(self.norm0_ve(last_stage))
+        finally:
+            for b in self.unregistered_blocks:
+                (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
 
-                    beam_search_nums_modify= min(beam_search_nums,num_pn)
-
-                    if choose_min == "max":
-                        min_value_value_Bls,min_idx_value_Bls = value_Bl.topk(beam_search_nums_modify, dim=-1, largest=False)
-                    elif choose_min == "max_2max":
-                        top2_values, top2_indices = probs.topk(2, dim=-1)
-                        prob_max_2max = 2 * top2_values[...,0] - top2_values[...,1]
-                        min_value_value_Bls,min_idx_value_Bls = prob_max_2max.topk(beam_search_nums_modify, dim=-1, largest=False)
-                    
-
-                    beam_find_best_idx_Bl = idx_Bl.clone()
-                    beam_find_best_score_Bl = torch.zeros(B,device=accu_BChw.device,dtype=accu_BChw.dtype)
-                    for beam_search_idx in  range(2 ** beam_search_nums_modify):
-                        beam_idx_Bl = idx_Bl.clone()
-                        beam_accu_BChw = accu_BChw.clone()
-                        beam_choose_p = torch.ones((B,1),device=accu_BChw.device,dtype=accu_BChw.dtype)
-                        for _search_idx in range(beam_search_nums_modify):
-
-                            pos_idx = min_idx_value_Bls[...,_search_idx].unsqueeze(-1)
-                            batch_indices = torch.arange(probs.shape[0], device=probs.device).view(-1, 1).expand(-1, pos_idx.shape[1])
-                            top2_values, top2_indices = probs[batch_indices,pos_idx].topk(2, dim=-1)
-                            if (beam_search_idx & 2**_search_idx) == 0:
-                                beam_choose_p = beam_choose_p + top2_values[...,0]
-                                continue 
-                                                
-                            beam_choose_p = beam_choose_p + top2_values[...,1]
-                            beam_idx_Bl[batch_indices,pos_idx] = top2_indices[...,1]
-                            # print(f"pos_idx:{pos_idx} chooose top2_indices:{top2_indices}")
-
-                        h_BChw = vae.quantize.embedding(beam_idx_Bl).float()   # BlC
-                        h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2])
-                        beam_accu_BChw, beam_last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), beam_accu_BChw, h_BChw)
-
-                        beam_last_stage = beam_last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
-                        beam_last_stage = self.word_embed(self.norm0_ve(beam_last_stage))
-                        beam_last_stage = beam_last_stage.repeat(bs//B, 1, 1)
-                        
-                        
-                        beam_BlV = self.get_scale_logits(si=nex_is, last_stage=beam_last_stage, cond_BD_or_gss=cond_BD_or_gss, \
-                                ca_kv = ca_kv, scale_schedule=scale_schedule, \
-                                B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=False)
-                        beam_logits_BlV = self.get_logits(beam_BlV[:B], cond_BD[:B])   
-                        # 不同batch的结果应该不一样
-                        beam_probs = F.softmax(beam_logits_BlV, dim=-1)
-                        if score_compare == "max":
-                            beam_value_max_Bl, beam_idx_max_Bl = beam_probs.max(dim=-1)
-                            beam_score = beam_value_max_Bl.sum(dim=-1)
-                        elif score_compare == "max_2max":
-                            top2_values, top2_indices = beam_probs.topk(2, dim=-1)
-                            prob_max_2max = 2 * top2_values[...,0] - top2_values[...,1]
-                            beam_score = prob_max_2max.sum(dim=-1)
-
-                        for _b in range(B):
-                            if beam_find_best_score_Bl[_b] < (beam_score[_b] + beam_choose_p[_b]):
-                                beam_find_best_idx_Bl[_b] = beam_idx_Bl[_b]
-                                beam_find_best_score_Bl[_b] = (beam_score[_b] + beam_choose_p[_b])
-
-                    idx_Bl = beam_find_best_idx_Bl
-            else :
-                idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=900, top_p=0.95, num_samples=1)[:, :, 0] # torch.Size([1, 1])
-            
-            h_BChw = vae.quantize.embedding(idx_Bl).float()   # torch.Size([1, 1, 32])
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][1], scale_schedule[si][2]) # torch.Size([1, 32, 2, 2])
-            
-            ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
-            idx_Bl_list.append(idx_Bl)
-            
-            
-            accu_BChw, last_stage = vae.quantize.get_next_autoregressive_input(si, len(self.raw_scale_schedule), accu_BChw, h_BChw)
-            
-            if si != num_stages_minus_1:
-                last_stage = last_stage.view(B, vae.Cvae, -1).transpose(1, 2)
-                last_stage = self.word_embed(self.norm0_ve(last_stage))
-                last_stage = last_stage.repeat(bs//B, 1, 1)
-                
-                
-                
-        for b in self.unregistered_blocks: 
-            (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
-
+        if return_fhat:
+            return ret, (accu_BChw,), None
 
         if not ret_img:
-            return ret, idx_Bl_list, []
-        
-        if self.use_diff:
-            # Calculate f_hat_predict from the generated idx_Bl_list
-            f_hat_predict = vae.idxBl_to_fhat(idx_Bl_list)
-            f_hat_diffusion = self.diffloss.sample(
-                    z=last_layer_cond, f_predict=f_hat_predict, temperature=1.0,  cfg=1.0
-                )
-            accu_BChw = f_hat_diffusion + accu_BChw
+            return ret, [], None
 
         img = vae.fhat_to_img(accu_BChw)
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8)
-        
-        return ret, idx_Bl_list, img
+        return ret, [], img
 
     
     def add_lvl_embeding(self, feature, scale_ind, scale_schedule, need_to_pad=0):
@@ -640,144 +623,177 @@ class SRVAR(nn.Module):
         return x_BLC
     
     def forward(
-        self, 
+        self,
         inp_B3HW_low: torch.Tensor,
-        # label_B_or_BLT: Tuple[torch.FloatTensor, torch.IntTensor, int], 
-        x_BLC_wo_prefix: torch.Tensor,
-        scale_schedule:List[Tuple[int]],
-        f_hat :torch.Tensor,
-        vae_local :VQVAE,
+        ms_h_target: List[torch.Tensor],
+        ms_x_input: Optional[torch.Tensor],
+        scale_schedule: List[Tuple[int, int, int]],
         ref_B3HW: Optional[torch.Tensor] = None,
-        cfg_infer=False,
-        **kwargs,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
-        # if cfg_infer:
-        #     return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
+        low_f_override: Optional[torch.Tensor] = None,
+        cfg_infer: bool = False,
+        scale0_loss_mask: bool = False,
+    ) -> torch.Tensor:
+        """Training forward.
 
-        B = x_BLC_wo_prefix.shape[0] # 4
+        Args:
+            inp_B3HW_low:   `[B, 3, H, W]` LR image, used only when
+                            `lr_cond_source='srvar_encoder'`.
+            ms_h_target:    list of `[B, C, pn, pn]` per-scale posterior means; the
+                            DiffLoss targets.
+            ms_x_input:     `[B, L-1, C]` teacher-forcing continuous tokens (already
+                            comes from VAE's `f_to_var_input_continuous`). May be
+                            `None` if `len(scale_schedule)==1`.
+            scale_schedule: list of (t, h, w) per scale.
+            ref_B3HW:       optional reference image (use_ref=True only).
+            low_f_override: `[B, low_len, C]` raw LR tokens; required when
+                            `lr_cond_source='lr_vae'`, ignored otherwise.
+            cfg_infer:      if True, disable training-time CFG dropout (used by infer).
+            scale0_loss_mask: if True, drop scale[0] tokens from the DiffLoss target/z.
 
-        x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32 torch.Size([4, 679, 32])
-        
-        # [1. get input sequence x_BLC]
+        Returns:
+            scalar DiffLoss.
+        """
+        # ---- sanity ----
+        SN = len(scale_schedule)
+        assert len(ms_h_target) == SN, \
+            f'len(ms_h_target)={len(ms_h_target)} != len(scale_schedule)={SN}'
+        if ms_x_input is not None:
+            B = ms_x_input.shape[0]
+            ms_x_input = ms_x_input.float()
+        else:
+            B = ms_h_target[0].shape[0]
+        device = ms_h_target[0].device
+
+        # ---- 1. LR conditioning ----
         with torch.amp.autocast('cuda', enabled=False):
-            low_f = self.quant_conv(self.encoder(inp_B3HW_low)) # torch.Size([4, 32, 16, 16])
-            low_f = low_f.permute(0, 2, 3, 1) # torch.Size([4, 16, 16, 32])
-            low_f = low_f.reshape(B, low_f.shape[1] * low_f.shape[2], low_f.shape[3])# torch.Size([4, 256, 32])
-            
-            if self.use_ref:
-                ref_f = self.quant_conv_ref(self.encoder_ref(ref_B3HW)) # torch.Size([4, 32, 16, 16])
-                ref_f = ref_f.permute(0, 2, 3, 1) # torch.Size([4, 16, 16, 32]) 
-                ref_f = ref_f.reshape(B, ref_f.shape[1] * ref_f.shape[2], ref_f.shape[3])# torch.Size([4, 256, 32])
-                low_f = torch.cat((low_f, ref_f), dim=1) # torch.Size([4, 512, 32])
+            low_f = self._encode_lr_to_low_f(inp_B3HW_low, ref_B3HW, low_f_override)
+            lowLen = low_f.shape[1]
+            assert lowLen <= self.cfg_uncond.shape[0], \
+                f'low_len={lowLen} exceeds cfg_uncond buffer length={self.cfg_uncond.shape[0]}; ' \
+                f'increase --tlen.'
+            lens = torch.full((B,), lowLen, dtype=torch.int32, device=device)
+            max_seqlen_k = lens.max()
+            cu_seqlens_k = torch.cumsum(
+                torch.cat([torch.zeros(1, dtype=torch.int32, device=device), lens]), dim=0
+            ).to(dtype=torch.int32)
 
-            # [3,679,32]
-            lowLen, lowC = low_f.shape[1], low_f.shape[2]
-            lens = torch.tensor([lowLen] * B,dtype=torch.int32).to(device=x_BLC_wo_prefix.device)  # 每个句子的 token 长度 torch.Size([4])
-            max_seqlen_k = lens.max().to(device=x_BLC_wo_prefix.device)  # 512
-            cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).to(device=x_BLC_wo_prefix.device), lens]), dim=0).to(device=x_BLC_wo_prefix.device).to(dtype = torch.int32)
-            
-            kv_compact = low_f # torch.Size([4, 512, 32])
-            if(len(kv_compact.shape) == 3): # B L C -> B*L C
-                kv_compact = kv_compact.reshape(-1,kv_compact.shape[-1]) # torch.Size([4*512, 32])
-            # drop cond
+            kv_compact = low_f.reshape(-1, low_f.shape[-1])      # [B*low_len, C]
+            # Classifier-free guidance dropout (training only).
             total = 0
             if not cfg_infer:
                 for le in lens:
                     if random.random() < self.cond_drop_rate:
-                        kv_compact[total:total+le] = self.cfg_uncond[:le]
-                    total += le
-            must_on_graph = self.cfg_uncond[0, 0] * 0
-            kv_compact = self.low_norm(kv_compact).contiguous() # torch.Size([2048, 32])
-            sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()    # cond_BD should be float32 torch.Size([4, 1024])
-            kv_compact = self.low_proj_for_ca(kv_compact).contiguous() # torch.Size([2048, 1024])
+                        kv_compact[total:total + le] = self.cfg_uncond[:le]
+                    total += int(le.item())
+            must_on_graph = self.cfg_uncond[0, 0] * 0           # keep cfg_uncond in graph
+            kv_compact = self.low_norm(kv_compact).contiguous()
+            sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()
+            kv_compact = self.low_proj_for_ca(kv_compact).contiguous()
             kv_compact[0, 0] += must_on_graph
             ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-            
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32 torch.Size([4, 1024])
-        
-            # with open('log.txt', 'a') as f:
-            #     f.write(f'sos:{sos.unsqueeze(1).expand(B, 1, -1)}\n')
-            #     f.write(f'sos:{self.pos_start.expand(B, 1, -1)}\n')        
-            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1) # torch.Size([4, 1, 1024])
-            x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1) # torch.Size([4, 680, 1024])
-            
-            # [1.1. pad the seqlen dim]
-            l_end = x_BLC.shape[1]
-            need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end # 0
-                 
 
-                
-            if self.use_flex_attn: # False
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()
+
+            # ---- 2. build x_BLC = [SOS, word_embed(ms_x_input)] ----
+            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+            if ms_x_input is not None:
+                x_BLC = torch.cat(
+                    (sos, self.word_embed(self.norm0_ve(ms_x_input))), dim=1
+                )
+            else:
+                x_BLC = sos
+
+            l_end = x_BLC.shape[1]
+            need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end
+
+            if self.use_flex_attn:
                 if need_to_pad:
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 assert x_BLC.shape[-1] % 128 == 0, 'x_BLC.shape[-1] % 128 != 0'
                 attn_bias_or_two_vector = None
-            else: # True
-                d: torch.Tensor = torch.cat([torch.full((pn[0]*pn[1]*pn[2],), i) for i, pn in enumerate(scale_schedule)]).view(1, l_end, 1)
-                dT = d.transpose(1, 2)    # dT: 11L
+            else:
+                d: torch.Tensor = torch.cat([
+                    torch.full((pn[0] * pn[1] * pn[2],), i) for i, pn in enumerate(scale_schedule)
+                ]).view(1, l_end, 1)
+                dT = d.transpose(1, 2)
                 attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, l_end, l_end)
-                attn_bias = attn_bias_for_masking[:, :, :l_end, :l_end].contiguous()   # attn_bias: 11LL
-                if need_to_pad: # False
+                attn_bias = attn_bias_for_masking[:, :, :l_end, :l_end].contiguous()
+                if need_to_pad:
                     attn_bias = F.pad(attn_bias, (0, need_to_pad, 0, need_to_pad), value=-torch.inf)
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
-        
-        if self.use_flex_attn: # False
-            attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
-        else: # True
-            attn_fn = None
-        
-        # [2. block loop]
-        SelfAttnBlock.forward, CrossAttnBlock.forward
+
+        attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)] if self.use_flex_attn else None
+
+        # ---- 3. transformer blocks ----
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
-        bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         if self.num_block_chunks == 1:
             for i, b in enumerate(self.blocks):
-                if self.add_lvl_embeding_only_first_block and i == 0:
-                    # x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
-                    x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if not self.add_lvl_embeding_only_first_block:
-                    # x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+                if (self.add_lvl_embeding_only_first_block and i == 0) or not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
                 if checkpointing_full_block:
-                    x_BLC = torch.utils.checkpoint.checkpoint(b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias, attn_fn, scale_schedule, self.rope2d_freqs_grid, use_reentrant=False)
+                    x_BLC = torch.utils.checkpoint.checkpoint(
+                        b, x_BLC, cond_BD_or_gss, ca_kv, attn_bias_or_two_vector, attn_fn,
+                        scale_schedule, self.rope2d_freqs_grid, use_reentrant=False,
+                    )
                 else:
-                    x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid)
+                    x_BLC = b(
+                        x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
+                        attn_bias_or_two_vector=attn_bias_or_two_vector,
+                        attn_fn=attn_fn, scale_schedule=scale_schedule,
+                        rope2d_freqs_grid=self.rope2d_freqs_grid,
+                    )
         else:
-            for i, chunk in enumerate(self.block_chunks): # this path
-                if self.add_lvl_embeding_only_first_block and i == 0:
-                    # x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+            for i, chunk in enumerate(self.block_chunks):
+                if (self.add_lvl_embeding_only_first_block and i == 0) or not self.add_lvl_embeding_only_first_block:
                     x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                if not self.add_lvl_embeding_only_first_block:
-                    # x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
-                    x_BLC = self.add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule, need_to_pad)
-                x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
-        
-        if self.use_diff:
-            start = sum([pn[0]*pn[1]*pn[2] for pn in scale_schedule[:-1]])
-            last_layer_cond = x_BLC[:, start: , :]
-            last_layer_cond = last_layer_cond.view(B, self.C, 16, 16)
-        x_BLC = self.get_logits(x_BLC[:, :l_end], cond_BD) # torch.Size([4, 680, 4096])
-        diff_loss = 0.0
+                x_BLC = chunk(
+                    x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
+                    attn_bias_or_two_vector=attn_bias_or_two_vector,
+                    attn_fn=attn_fn, scale_schedule=scale_schedule,
+                    checkpointing_full_block=checkpointing_full_block,
+                    rope2d_freqs_grid=self.rope2d_freqs_grid,
+                )
 
-        if self.use_diff:
-            idx_Bl = x_BLC.argmax(dim=-1) # torch.Size([4, 680])
-            idx_Bl_list = [] 
-            curL = 0
-            for scale in scale_schedule:
-                curL_next = curL + np.prod(scale)
-                idx_Bl_list.append(idx_Bl[:, curL:curL_next])
-                curL = curL_next
+        # ---- 4. project to DiffLoss condition `z` ----
+        z_BLD = self.get_logits(x_BLC[:, :l_end], cond_BD)        # [B, L, D=C]
 
-            f_hat_predict = vae_local.idxBl_to_fhat(idx_Bl_list)
-            f_minus_f_hat = f_hat - f_hat_predict
-            f_minus_f_hat_detach = f_minus_f_hat.detach()
-            diff_loss = self.forward_diff_loss(
-                z=last_layer_cond.detach(), target=f_minus_f_hat_detach, f_predict=f_hat_predict.detach()
-            )
-        # [3. unpad the seqlen dim, and then get logits]
-        return x_BLC, diff_loss    # return logits BLV, V is vocab_size    
+        # ---- 5. build target tensor and call DiffLoss ----
+        # Target tokens are laid out scale-by-scale to match the transformer order.
+        # For scale `si`, target[si] has `pn^2` tokens of dim Cvae.
+        target_list: List[torch.Tensor] = []
+        for si, pn in enumerate(scale_schedule):
+            h = ms_h_target[si]                                    # [B, Cvae, pn_h, pn_w]
+            target_list.append(
+                h.reshape(h.shape[0], h.shape[1], -1).transpose(1, 2).contiguous()
+            )                                                      # [B, pn^2, Cvae]
+        target_BLC = torch.cat(target_list, dim=1)                 # [B, L, Cvae]
+        assert target_BLC.shape[1] == z_BLD.shape[1], \
+            f'target tokens {target_BLC.shape} != z tokens {z_BLD.shape}'
+
+        # Flatten over B*L for DiffLoss.
+        z_flat = z_BLD.reshape(-1, z_BLD.shape[-1]).contiguous()
+        tgt_flat = target_BLC.reshape(-1, target_BLC.shape[-1]).contiguous()
+
+        # Optional mask: drop scale[0] tokens (used in Plan-A `--skip_scale0_loss`).
+        loss_mask: Optional[torch.Tensor] = None
+        if scale0_loss_mask:
+            num_scale0 = int(scale_schedule[0][0] * scale_schedule[0][1] * scale_schedule[0][2])
+            mask_BL = torch.ones(B, target_BLC.shape[1], device=device, dtype=torch.float32)
+            mask_BL[:, :num_scale0] = 0.0
+            loss_mask = mask_BL.reshape(-1)
+
+        # MAR-style diffloss_batch_mul: repeat the per-token pairs to reduce variance.
+        mul = self.diffloss_batch_mul if self.training else 1
+        if mul > 1:
+            z_flat = z_flat.repeat_interleave(mul, dim=0)
+            tgt_flat = tgt_flat.repeat_interleave(mul, dim=0)
+            if loss_mask is not None:
+                loss_mask = loss_mask.repeat_interleave(mul, dim=0)
+
+        loss = self.diffloss(target=tgt_flat, z=z_flat, mask=loss_mask)
+        return loss
         
     def load_state_dict(self, state_dict: Dict[str, Any], strict=False, assign=False):
         for k in state_dict:
@@ -797,20 +813,22 @@ class SRVAR(nn.Module):
         scale_head: float,
         scale_proj: int,
     ):
-        # init head's norm
+        # init head's norm (AdaLN that produces the DiffLoss condition projection)
         if isinstance(self.head_nm, AdaLNBeforeHead):
-            self.head_nm.ada_lin[-1].weight.data.mul_(aln_init)    # there's no gamma for head
+            self.head_nm.ada_lin[-1].weight.data.mul_(aln_init)
             if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
                 self.head_nm.ada_lin[-1].bias.data.zero_()
-        
-        # init head's proj
+
+        # init head's projection
         if scale_head >= 0:
             if isinstance(self.head, nn.Linear):
                 self.head.weight.data.mul_(scale_head)
-                self.head.bias.data.zero_()
+                if self.head.bias is not None:
+                    self.head.bias.data.zero_()
             elif isinstance(self.head, nn.Sequential):
                 self.head[-1].weight.data.mul_(scale_head)
-                self.head[-1].bias.data.zero_()
+                if self.head[-1].bias is not None:
+                    self.head[-1].bias.data.zero_()
         
         depth = len(self.unregistered_blocks)
         for block_idx, sab in enumerate(self.unregistered_blocks): 
@@ -870,94 +888,26 @@ class SRVAR(nn.Module):
                     nn.init.constant_(m.weight.data, 1.)
     
     def init_LREncoder(self, vae_local: VQVAE):
+        """Copy encoder/quant_conv weights from the frozen HR VAE into SRVAR's own
+        encoder. No-op when `lr_cond_source='lr_vae'` (we don't have a local encoder).
+        """
+        if self.lr_cond_source != 'srvar_encoder':
+            print(f"[init_LREncoder] skipped (lr_cond_source={self.lr_cond_source}).")
+            return
+        assert self.encoder is not None and self.quant_conv is not None
         self.encoder.load_state_dict(vae_local.encoder.state_dict())
         self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
 
         if self.use_ref:
             self.encoder_ref.load_state_dict(vae_local.encoder.state_dict())
             self.quant_conv_ref.load_state_dict(vae_local.quant_conv.state_dict())
-        
+
         print("LRencoder loaded from vae_local")
         
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 if __name__ == "__main__":
-    
-    
-    vqvae = VQVAE().cuda()
-    low_channel = 32
-    var = SRVAR(vqvae,
-                low_channel=low_channel,
-                low_len=512,
-                block_chunks = 4,
-                # pad_to_multiplier=128,
-                # use_flex_attn=True,
-                pn="1M",
-                rope2d_normalized_by_hw = 2,
-                checkpointing = "full-block",
-                
-                
-                ).cuda()
-    # var = SRVAR(vqvae,low_channel=2048,low_len=512,block_chunks = 4).cuda()
-    
-    
-    tini: float = 0.02     
-    diva: int = 1                       # rescale_attn_fc_weights
-    hd0: float = 0.02  
-    aln: float = 1e-3                   # multiplier of ada_lin.w's initialization
-    alng: float = -1 
-    var.init_weights(other_std=tini)
-    var.special_init(aln_init=aln, aln_gamma_init=alng, scale_head=hd0, scale_proj=diva)
-
-    
-    import os
-    import torch.distributed as tdist
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    tdist.init_process_group("nccl", rank=0, world_size=1)
-
-    inp_B3HW = torch.randn(3, 3, 256, 256).cuda()
-    
-    gt_idx_Bl= vqvae.img_to_idxBl(inp_B3HW)
-    gt_BL = torch.cat(gt_idx_Bl, dim=1)
-    x_BLCv_wo_first_l = vqvae.quantize.idxBl_to_var_input(gt_idx_Bl)
-    print(x_BLCv_wo_first_l.shape)
-    
-    lens = torch.tensor([3, 5, 2],dtype=torch.int32).cuda()  # 每个句子的 token 长度
-    max_seqlen_k = lens.max().cuda()  # 5
-    cu_seqlens_k = torch.cumsum(torch.cat([torch.tensor([0],dtype=torch.int32).cuda(), lens]), dim=0).cuda()
-    
-    cu_seqlens_k = cu_seqlens_k.to(dtype = torch.int32)
-
-    label_B_or_BLT = (torch.randn(sum(lens), low_channel).cuda(), lens, cu_seqlens_k, max_seqlen_k)
-    
-    B = inp_B3HW.shape[0]  # if isinstance(inp_B3HW, torch.Tensor) else inp_B3HW[0].shape[0]
-    T = 1 if inp_B3HW.dim() == 4 else inp_B3HW.shape[2]
-    V = vqvae.vocab_size
-    device = inp_B3HW.device
-
-    h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
-    h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-    h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-    scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
-    scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
-    # raw_scale_schedule = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
-    # scale_schedule = [(1,h,h) for h in raw_scale_schedule]
-    
-    # logits = var(label_B_or_BLT, x_BLCv_wo_first_l, scale_schedule)
-    # print(logits.shape)
-    # logits.mean().backward()
-    _,_,image_list = var.autoregressive_infer_cfg(
-        B = 3,
-        vae=vqvae,
-        label_B_or_BLT=label_B_or_BLT, 
-        scale_schedule=scale_schedule,
-        cfg_list=[1.0]*len(scale_schedule),tau_list=[1.0]*len(scale_schedule),
-        ret_img = True,
-        top_k=1,top_p=1.0,
-        inference_mode=True
-    )
-    from PIL import Image
-    Image.fromarray(image_list[0].detach().cpu().numpy()).save("test.png")
-    
+    # Smoke test removed: relied on the legacy discrete VAR API.
+    # See metric.py / SRtrainer.train_step for the new entry points.
+    pass

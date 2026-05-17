@@ -24,18 +24,43 @@ import dist
 
 class Args(Tap):
     use_ref: bool = False
-    use_diff:bool = False
+    use_diff: bool = True            # always True now (continuous DiffLoss head); kept for ckpt compat
     zero: int = 0                       # ds zero
     data_path: str = '/path/to/imagenet'
     enable_checkpointing: str = None    # checkpointing strategy: full-block, self-attn
     pad_to_multiplier: int = 1          # >1 for padding the seq len to a multiplier of this
-    train_h_div_w_list :list = [1.0]
-    val_and_saving_per_ep:int = 5
-    use_are_loss_weight:bool = False
+    train_h_div_w_list: list = [1.0]
+    val_and_saving_per_ep: int = 5
+    use_are_loss_weight: bool = False
     # VAE
-    vocab_size: int = 4096
+    vocab_size: int = 0                 # unused for continuous VAE; kept for ckpt compat
     vae_ckpt: str = None
-    vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
+    vae_ch: int = 128                   # HR VAE base channel; must match stage2 ckpt
+    quant_resi: float = 0.5             # quant_resi ratio; must match stage2 ckpt
+    share_quant_resi: int = 4           # quant_resi share mode; must match stage2 ckpt
+    vfast: int = 0
+    # LR conditioning
+    lr_folder: str = 'LR_64x64'         # subdir under DATA_PATH/{train,val} for LR images
+    hr_folder: str = 'HR'               # subdir under DATA_PATH/{train,val} for HR images
+    lr_cond_source: str = 'srvar_encoder'  # 'srvar_encoder' or 'lr_vae'
+    stage1_ckpt: str = ''               # non-empty -> build & load LR_VAE
+    skip_scale0_loss: bool = False      # plan-A only: drop scale[0] from DiffLoss target/z
+    same_shape: bool = False            # if True, LR is bicubic-resized to HR size (legacy)
+    # DiffLoss head
+    diffloss_w: int = 1024
+    diffloss_d: int = 3
+    diff_steps: str = '100'             # inference sampling steps (spaced IDDPM)
+    diffloss_batch_mul: int = 4         # per-token MAR-style batch multiplier
+    cfg_infer: float = 1.0              # inference CFG scale (>1 sharpens condition)
+    # Reconstruction visualization / metadata
+    save_reconstruction_images: bool = True
+    reconstruction_save_interval: int = 0   # 0: follow train log iters; >0: every N iters
+    reconstruction_max_samples: int = 4
+    reconstruction_dir_name: str = 'reconstruction_samples'
+    record_reconstruction_metadata: bool = True
+    eval_ar_max_batches: int = 4
+    train_log_points_per_epoch: int = 8
+    log_train_psnr: bool = False
     # VAR
     # depth: int = 16     # VAR depth
     # ini: float = -1     # -1: automated model parameter initialization

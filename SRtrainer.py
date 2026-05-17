@@ -1,220 +1,395 @@
+"""SRVARTrainer: continuous AR trainer for var/.
+
+Replaces the discrete CrossEntropy-based trainer. The main loss is DiffLoss; we
+keep auxiliary metrics (latent_mse, train_psnr/train_ssim, val PSNR/SSIM) for
+visibility during training.
+"""
+import os
 import time
 from typing import List, Optional, Tuple, Union
-from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
-import torch
+
 import numpy as np
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import dist
-from models import SRVAR, VQVAE, VectorQuantizer2
+from models import SRVAR, VQVAE
 from utils.amp_sc import AmpOptimizer
+from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 from utils.misc import MetricLogger, TensorboardLogger
 
 Ten = torch.Tensor
-FTen = torch.Tensor
-ITen = torch.LongTensor
-BTen = torch.BoolTensor
+
+
+def _resolve_scale_schedule(
+    inp_low: torch.Tensor,
+    patch_nums: Tuple[int, ...],
+    pn_str: str = "1M",
+) -> List[Tuple[int, int, int]]:
+    """Pick the (t, h, w) scale schedule.
+
+    Prefers `dynamic_resolution_h_w[h_div_w]['1M']['scales']` for compat with
+    the original codebase; falls back to `[(1, pn, pn) for pn in patch_nums]`
+    when the lengths disagree.
+    """
+    h_div_w = inp_low.shape[-2] / inp_low.shape[-1]
+    T = 1 if inp_low.dim() == 4 else inp_low.shape[2]
+    keys = np.array(list(dynamic_resolution_h_w.keys()))
+    template = keys[np.argmin(np.abs(h_div_w - keys))]
+    scales = dynamic_resolution_h_w[template][pn_str]['scales']
+    scales = [(min(t, T // 4 + 1), h, w) for (t, h, w) in scales]
+    if len(scales) != len(patch_nums):
+        scales = [(1, pn, pn) for pn in patch_nums]
+        if dist.is_master():
+            print(f'[scale_schedule] fallback to [(1,pn,pn)]; patch_nums={patch_nums}')
+    else:
+        for i, (t, h, w) in enumerate(scales):
+            assert h == patch_nums[i] and w == patch_nums[i], \
+                f'scale_schedule[{i}]=({t},{h},{w}) inconsistent with patch_nums[{i}]={patch_nums[i]}'
+    return scales
 
 
 class SRVARTrainer(object):
     def __init__(
-        self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-        vae_local: VQVAE, srvar_wo_ddp: SRVAR, srvar: DDP,
-        var_opt: AmpOptimizer, label_smooth: float, use_are_loss_weight: bool = False
+        self,
+        device,
+        patch_nums: Tuple[int, ...],
+        resos: Tuple[int, ...],
+        vae_local: VQVAE,
+        srvar_wo_ddp: SRVAR,
+        srvar: DDP,
+        var_opt: AmpOptimizer,
+        label_smooth: float = 0.0,                  # kept for ckpt compat, unused (no CE)
+        use_are_loss_weight: bool = False,          # kept for ckpt compat, unused
+        lr_vae=None,                                # frozen LR_VAE (optional, plan-A)
+        lr_cond_source: str = 'srvar_encoder',
+        skip_scale0_loss: bool = False,
+        diffloss_batch_mul: int = 4,
+        args=None,                                  # full args (for reconstruction metadata)
     ):
-        super(SRVARTrainer, self).__init__()
-        
-        self.srvar, self.vae_local, self.quantize_local = srvar, vae_local, vae_local.quantize
-        self.quantize_local: VectorQuantizer2
-        self.srvar_wo_ddp: SRVAR = srvar_wo_ddp  # after torch.compile
+        super().__init__()
+        self.srvar, self.vae_local = srvar, vae_local
+        self.quantize_local = vae_local.quantize
+        self.srvar_wo_ddp: SRVAR = srvar_wo_ddp
         self.var_opt = var_opt
-        
+        self.lr_vae = lr_vae
+        self.lr_cond_source = lr_cond_source
+        self.skip_scale0_loss = skip_scale0_loss
+        self.diffloss_batch_mul = int(diffloss_batch_mul)
+        self.args = args
+
         del self.srvar_wo_ddp.rng
         self.srvar_wo_ddp.rng = torch.Generator(device=device)
-        
+
         self.patch_nums, self.resos = patch_nums, resos
-        self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(patch_nums):
-            self.begin_ends.append((cur, cur + pn * pn))
-            cur += pn*pn
-        
-        self.label_smooth = label_smooth
-        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
-        self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
         self.L = sum(pn * pn for pn in patch_nums)
-        self.last_l = patch_nums[-1] * patch_nums[-1]
-        self.loss_weight = torch.ones(1, self.L, device=device) / self.L
-        
-        if use_are_loss_weight:
-            step = 1.0 / len(patch_nums)
-            are_loss_weight = 1.0
-            for index,(begin,ed) in enumerate(self.begin_ends):
-                print(f"begin:{begin},end:{ed},are_loss_weight:{are_loss_weight}")
-                self.loss_weight[:, begin:ed] *= are_loss_weight
-                are_loss_weight -= step
-            
-        
+        self.label_smooth = label_smooth
         self.prog_it = 0
         self.last_prog_si = -1
         self.first_prog = True
-    
+
+        # Tracks whether we've already written the `run_metadata.json` for this run.
+        self._reconstruction_metadata_written: bool = False
+
+    # ----------------------------------------------------------------- helpers
+    def _build_targets(self, inp_B3HW_super: Ten):
+        """Run the frozen VAE to get `(ms_h_target, ms_x_input)` under no_grad."""
+        with torch.no_grad():
+            ms_h_target, ms_x_input, f_hat_full = self.vae_local.img_to_ms_continuous_input(inp_B3HW_super)
+        return ms_h_target, ms_x_input, f_hat_full
+
+    def _maybe_lr_vae_override(
+        self,
+        inp_B3HW_low: Ten,
+        ms_h_target: List[Ten],
+    ) -> Tuple[List[Ten], Optional[Ten]]:
+        """When stage1 LR_VAE is enabled, override `ms_h_target[0]` with the
+        LR_VAE encoded scale[0] latent. Also return the LR_VAE-derived `low_f`
+        when `lr_cond_source='lr_vae'`."""
+        low_f_override: Optional[Ten] = None
+        if self.lr_vae is not None:
+            with torch.no_grad():
+                lr_mean = self.lr_vae.encode_to_posterior_mean(inp_B3HW_low)  # [B, C, h0, w0]
+            # Sanity on scale[0] shape consistency.
+            B, C, h, w = lr_mean.shape
+            assert ms_h_target[0].shape == lr_mean.shape, (
+                f'LR_VAE latent {tuple(lr_mean.shape)} != scale[0] target '
+                f'{tuple(ms_h_target[0].shape)}; check patch_nums[0] vs lr_img_size/16'
+            )
+            ms_h_target[0] = lr_mean.contiguous()
+            if self.lr_cond_source == 'lr_vae':
+                low_f_override = lr_mean.reshape(B, C, -1).transpose(1, 2).contiguous()  # [B, h*w, C]
+        return ms_h_target, low_f_override
+
+    # ----------------------------------------------------------------- eval
     @torch.no_grad()
-    def eval_ep(self, ld_val: DataLoader, use_ref):
+    def eval_ep(
+        self,
+        ld_val: DataLoader,
+        use_ref: bool,
+        eval_ar_max_batches: int = 4,
+        cfg_infer_scale: float = 1.0,
+        temperature: float = 1.0,
+    ):
+        """Compute val DiffLoss; additionally run AR inference on up to
+        `eval_ar_max_batches` batches and compute PSNR/SSIM.
+        """
         tot = 0
-        L_mean, L_tail, acc_mean, acc_tail, diff_loss_mean = 0, 0, 0, 0, 0
+        diff_loss_sum = 0.0
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        ar_count = 0
         stt = time.time()
         training = self.srvar_wo_ddp.training
         self.srvar_wo_ddp.eval()
-        for datas in ld_val:
+
+        for batch_idx, datas in enumerate(ld_val):
             if use_ref:
                 inp_B3HW_low, inp_B3HW_super, ref_B3HW = datas
+                ref_B3HW = ref_B3HW.to(dist.get_device(), non_blocking=True)
             else:
                 inp_B3HW_low, inp_B3HW_super = datas
                 ref_B3HW = None
-            B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size
             inp_B3HW_low = inp_B3HW_low.to(dist.get_device(), non_blocking=True)
             inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
-            
-            gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
-            gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
-            x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super)
-            
-            h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
-            T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
-            h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-            h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-            scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
-            scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
-            
-            self.srvar_wo_ddp.forward
-            logits_BLV, diff_loss = self.srvar(
-                                    inp_B3HW_low = inp_B3HW_low, \
-                                    ref_B3HW = ref_B3HW, \
-                                    x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
-                                    scale_schedule = scale_schedule, \
-                                    f_hat = f_hat_super, \
-                                    vae_local=self.vae_local)
-            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)) * B
-            diff_loss_mean += diff_loss * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)) * B
-            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL_super).sum() * (100/gt_BL_super.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL_super[:, -self.last_l:]).sum() * (100 / self.last_l)
+            B = inp_B3HW_low.shape[0]
+
+            ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
+            ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
+            scale_schedule = _resolve_scale_schedule(inp_B3HW_low, self.patch_nums)
+
+            loss = self.srvar(
+                inp_B3HW_low=inp_B3HW_low,
+                ms_h_target=ms_h_target,
+                ms_x_input=ms_x_input,
+                scale_schedule=scale_schedule,
+                ref_B3HW=ref_B3HW,
+                low_f_override=low_f_override,
+                cfg_infer=True,
+                scale0_loss_mask=self.skip_scale0_loss,
+            )
+            diff_loss_sum += float(loss.item()) * B
             tot += B
+
+            # AR-based PSNR/SSIM on a few batches.
+            if ar_count < eval_ar_max_batches:
+                try:
+                    from utils.image_saver import compute_psnr_ssim
+                    rec_img = self._quick_reconstruction(
+                        inp_B3HW_low, scale_schedule, ref_B3HW, low_f_override,
+                        cfg=cfg_infer_scale, temperature=temperature,
+                    )
+                    metrics = compute_psnr_ssim(rec_img, inp_B3HW_super)
+                    psnr_sum += metrics['psnr_mean'] * B
+                    ssim_sum += metrics['ssim_mean'] * B
+                    ar_count += 1
+                except Exception as e:
+                    if dist.is_master():
+                        print(f'[eval_ep] AR inference failed on batch {batch_idx}: {e}')
+
         self.srvar_wo_ddp.train(training)
-        
-        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), 
-                                   acc_mean.item(), acc_tail.item(), 
-                                   diff_loss_mean.item() if isinstance(diff_loss_mean, torch.Tensor) else diff_loss_mean,
-                                   tot])
+
+        stats = torch.tensor(
+            [diff_loss_sum, psnr_sum, ssim_sum, float(tot), float(ar_count)],
+            device=dist.get_device(),
+        )
         dist.allreduce(stats)
-        tot = round(stats[-1].item())
-        stats /= tot
-        L_mean, L_tail, acc_mean, acc_tail, diff_loss, _ = stats.tolist()
-        return L_mean, L_tail, acc_mean, acc_tail, diff_loss, tot, time.time()-stt
-    
+        tot = int(round(stats[3].item())) or 1
+        ar_count_total = int(round(stats[4].item())) or 1
+        diff_loss = float(stats[0].item() / tot)
+        # AR metrics are averaged over batches that actually ran AR.
+        psnr_mean = float(stats[1].item() / max(1, tot)) if ar_count > 0 else 0.0
+        ssim_mean = float(stats[2].item() / max(1, tot)) if ar_count > 0 else 0.0
+        return diff_loss, psnr_mean, ssim_mean, tot, time.time() - stt
+
+    @torch.no_grad()
+    def _quick_reconstruction(
+        self,
+        inp_B3HW_low: Ten,
+        scale_schedule: List[Tuple[int, int, int]],
+        ref_B3HW: Optional[Ten],
+        low_f_override: Optional[Ten],
+        cfg: float = 1.0,
+        temperature: float = 1.0,
+    ) -> Ten:
+        """Run AR sampling and return reconstructed HR `[B, 3, H, W]` in [-1, 1]."""
+        was_training = self.srvar_wo_ddp.training
+        self.srvar_wo_ddp.eval()
+        try:
+            _, fhat_tup, _ = self.srvar_wo_ddp.autoregressive_infer_cfg(
+                vae=self.vae_local,
+                scale_schedule=scale_schedule,
+                inp_B3HW_low=inp_B3HW_low,
+                ref_B3HW=ref_B3HW,
+                low_f_override=low_f_override,
+                B=inp_B3HW_low.shape[0],
+                return_fhat=True,
+                cfg=cfg,
+                temperature=temperature,
+            )
+            f_hat = fhat_tup[0]
+            rec = self.vae_local.fhat_to_img(f_hat)
+        finally:
+            self.srvar_wo_ddp.train(was_training)
+        return rec
+
+    # ----------------------------------------------------------------- train
     def train_step(
-        self, ep:int, it: int, g_it: int, stepping: bool,  clip_decay_ratio: float,metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        inp_B3HW_low: FTen, inp_B3HW_super: FTen, ref_B3HW: Optional[FTen], prog_si: int, prog_wp_it: float,
+        self,
+        ep: int,
+        it: int,
+        g_it: int,
+        stepping: bool,
+        clip_decay_ratio: float,
+        metric_lg: MetricLogger,
+        tb_lg: TensorboardLogger,
+        inp_B3HW_low: Ten,
+        inp_B3HW_super: Ten,
+        ref_B3HW: Optional[Ten],
+        prog_si: int,
+        prog_wp_it: float,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
-        
-        
-        # if progressive training
+        """One training step on a (LR, HR[, ref]) batch."""
+        # Progressive training compat (passed through; quant.prog_si stays -1).
         self.srvar_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
         if self.last_prog_si != prog_si:
-            if self.last_prog_si != -1: self.first_prog = False
+            if self.last_prog_si != -1:
+                self.first_prog = False
             self.last_prog_si = prog_si
             self.prog_it = 0
         self.prog_it += 1
         prog_wp = max(min(self.prog_it / prog_wp_it, 1), 0.01)
-        if self.first_prog: prog_wp = 1    # no prog warmup at first prog stage, as it's already solved in wp
-        if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
-        
+        if self.first_prog:
+            prog_wp = 1
+        if prog_si == len(self.patch_nums) - 1:
+            prog_si = -1
+
         self.srvar.require_backward_grad_sync = stepping
-        
-        # forward
-        B, V = inp_B3HW_low.shape[0], self.vae_local.vocab_size # B: batch size 4, V: vocabulary size 4096
-        
-        gt_idx_Bl_super, f_hat_super = self.vae_local.img_to_idxBl(inp_B3HW_super,return_fhat=True)
-        gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1) # 1 + 4 + 9 + 16 + 25 + 36 + 64 + 100 + 169 + 256 = 680
-        x_BLCv_wo_first_l_super: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl_super) # torch.Size([4, 679, 32])
-        
-        h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1] # 看不懂
-        T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
-        h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-        h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-        scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
-        scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
-        
+
+        B = inp_B3HW_low.shape[0]
+        ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
+        ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
+        scale_schedule = _resolve_scale_schedule(inp_B3HW_low, self.patch_nums)
+
         with self.var_opt.amp_ctx:
-            self.srvar_wo_ddp.forward 
-            logits_BLV, diff_loss = self.srvar(inp_B3HW_low = inp_B3HW_low, \
-                                               x_BLC_wo_prefix = x_BLCv_wo_first_l_super, \
-                                                ref_B3HW = ref_B3HW, \
-                                               scale_schedule = scale_schedule, \
-                                               f_hat = f_hat_super, \
-                                               vae_local=self.vae_local)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL_super.view(-1)).view(B, -1) # torch.Size([4, 680])
-            if prog_si >= 0:    # in progressive training
-                bg, ed = self.begin_ends[prog_si]
-                assert logits_BLV.shape[1] == gt_BL_super.shape[1] == ed
-                lw = self.loss_weight[:, :ed].clone()
-                lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
-            else:               # not in progressive training
-                lw = self.loss_weight # torch.Size([1, 680])
-            loss = loss.mul(lw).sum(dim=-1).mean() + diff_loss * 2.0  
-        
-        # backward
-        # grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
-        grad_norm, scale_log2 = self.var_opt.backward_clip_step(ep=ep, it=it, g_it=g_it, stepping=stepping, loss=loss, clip_decay_ratio=clip_decay_ratio)
-        # log
-        pred_BL = logits_BLV.data.argmax(dim=-1)
+            loss = self.srvar(
+                inp_B3HW_low=inp_B3HW_low,
+                ms_h_target=ms_h_target,
+                ms_x_input=ms_x_input,
+                scale_schedule=scale_schedule,
+                ref_B3HW=ref_B3HW,
+                low_f_override=low_f_override,
+                cfg_infer=False,
+                scale0_loss_mask=self.skip_scale0_loss,
+            )
+
+        grad_norm, scale_log2 = self.var_opt.backward_clip_step(
+            ep=ep, it=it, g_it=g_it, stepping=stepping, loss=loss, clip_decay_ratio=clip_decay_ratio,
+        )
+
+        # Light-weight metric logging on the configured log iterations.
         if it == 0 or it in metric_lg.log_iters:
-            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL_super.view(-1)).item() # float
-            acc_mean = (pred_BL == gt_BL_super).float().mean().item() * 100 # int
-            if prog_si >= 0:    # in progressive training
-                Ltail = acc_tail = -1
-            else:               # not in progressive training
-                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL_super[:, -self.last_l:].reshape(-1)).item() # self.last_l = 256
-                acc_tail = (pred_BL[:, -self.last_l:] == gt_BL_super[:, -self.last_l:]).float().mean().item() * 100
-            grad_norm = grad_norm.item()
-            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm, 
-                             diff_loss=diff_loss.item() if isinstance(diff_loss, torch.Tensor) else diff_loss, 
-                             step=g_it)
-        
-        # log to tensorboard
+            grad_norm_val = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+            metric_lg.update(
+                Ld=float(loss.item()),
+                tnm=grad_norm_val,
+                step=g_it,
+            )
+
+            # Reconstruction visualization + auxiliary PSNR (cheap-ish).
+            if self.args is not None and getattr(self.args, 'save_reconstruction_images', True):
+                try:
+                    self._maybe_save_reconstruction(
+                        ep, it, inp_B3HW_low, inp_B3HW_super, ref_B3HW,
+                        low_f_override, scale_schedule,
+                    )
+                except Exception as e:
+                    if dist.is_master():
+                        print(f'[train_step] reconstruction save skipped: {e}')
+
         if g_it == 0 or (g_it + 1) % 500 == 0:
-            prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
-            dist.allreduce(prob_per_class_is_chosen)
-            prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
-            cluster_usage = (prob_per_class_is_chosen > 0.001 / V).float().mean().item() * 100
             if dist.is_master():
-                if g_it == 0:
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)
-                kw = dict(z_voc_usage=cluster_usage)
-                for si, (bg, ed) in enumerate(self.begin_ends):
-                    if 0 <= prog_si < si: break
-                    pred, tar = logits_BLV.data[:, bg:ed].reshape(-1, V), gt_BL_super[:, bg:ed].reshape(-1)
-                    acc = (pred.argmax(dim=-1) == tar).float().mean().item() * 100
-                    ce = self.val_loss(pred, tar).item()
-                    kw[f'acc_{self.resos[si]}'] = acc
-                    kw[f'L_{self.resos[si]}'] = ce
-                tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
-                tb_lg.update(head='AR_iter_schedule', prog_a_reso=self.resos[prog_si], prog_si=prog_si, prog_wp=prog_wp, step=g_it)
-        
+                tb_lg.update(
+                    head='AR_iter_loss',
+                    diff_loss=float(loss.item()),
+                    step=g_it,
+                )
+                tb_lg.update(head='AR_iter_schedule', prog_si=prog_si, prog_wp=prog_wp, step=g_it)
+
         self.srvar_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2
-    
+
+    # ----------------------------------------------------------------- visualization
+    def _maybe_save_reconstruction(
+        self,
+        ep: int,
+        it: int,
+        inp_B3HW_low: Ten,
+        inp_B3HW_super: Ten,
+        ref_B3HW: Optional[Ten],
+        low_f_override: Optional[Ten],
+        scale_schedule: List[Tuple[int, int, int]],
+    ):
+        """Render a 3-column LR_upsampled | HR_pred | HR_gt grid every log iter."""
+        if not dist.is_master():
+            return
+        from utils.image_saver import save_reconstruction_comparison
+        from utils.image_saver import save_reconstruction_run_metadata
+
+        args = self.args
+        save_dir = os.path.join(
+            getattr(args, 'local_out_dir_path', './local_output'),
+            getattr(args, 'reconstruction_dir_name', 'reconstruction_samples'),
+        )
+
+        max_samples = int(getattr(args, 'reconstruction_max_samples', 4))
+        max_B = min(inp_B3HW_low.shape[0], max_samples)
+        with torch.no_grad():
+            rec = self._quick_reconstruction(
+                inp_B3HW_low[:max_B], scale_schedule,
+                ref_B3HW[:max_B] if ref_B3HW is not None else None,
+                low_f_override[:max_B] if low_f_override is not None else None,
+            )
+
+        save_reconstruction_comparison(
+            lr=inp_B3HW_low[:max_B],
+            hr_pred=rec,
+            hr_gt=inp_B3HW_super[:max_B],
+            save_dir=save_dir,
+            ep=ep,
+            it=it,
+            max_samples=max_samples,
+        )
+
+        if not self._reconstruction_metadata_written and getattr(args, 'record_reconstruction_metadata', True):
+            save_reconstruction_run_metadata(
+                save_dir=save_dir,
+                args_state=args.state_dict() if hasattr(args, 'state_dict') else {},
+                stage_name="SRVAR continuous AR (DiffLoss head)",
+                frequency_description=(
+                    "Every train_log iter (and optionally every N iters via reconstruction_save_interval)"
+                ),
+                max_samples=max_samples,
+            )
+            self._reconstruction_metadata_written = True
+
+    # ----------------------------------------------------------------- ckpt
     def get_config(self):
         return {
-            'patch_nums':   self.patch_nums, 'resos': self.resos,
+            'patch_nums': self.patch_nums,
+            'resos': self.resos,
             'label_smooth': self.label_smooth,
-            'prog_it':      self.prog_it, 'last_prog_si': self.last_prog_si, 'first_prog': self.first_prog,
+            'prog_it': self.prog_it,
+            'last_prog_si': self.last_prog_si,
+            'first_prog': self.first_prog,
+            'lr_cond_source': self.lr_cond_source,
+            'skip_scale0_loss': self.skip_scale0_loss,
+            'diffloss_batch_mul': self.diffloss_batch_mul,
         }
-    
+
     def state_dict(self):
         state = {'config': self.get_config()}
         for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
@@ -223,11 +398,13 @@ class SRVARTrainer(object):
                 if hasattr(m, '_orig_mod'):
                     m = m._orig_mod
                 state[k] = m.state_dict()
+        if self.lr_vae is not None:
+            state['lr_vae'] = self.lr_vae.state_dict()
         return state
-    
+
     def load_state_dict(self, state, strict=True, skip_vae=False):
         for k in ('srvar_wo_ddp', 'vae_local', 'var_opt'):
-            if skip_vae and 'vae' in k: 
+            if skip_vae and 'vae' in k:
                 print("load var and skip var's vaex!")
                 continue
             m = getattr(self, k)
@@ -239,14 +416,19 @@ class SRVARTrainer(object):
                     missing, unexpected = ret
                     print(f'[VARTrainer.load_state_dict] {k} missing:  {missing}')
                     print(f'[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}')
-        
+
+        if self.lr_vae is not None and 'lr_vae' in state:
+            self.lr_vae.load_state_dict(state['lr_vae'], strict=strict)
+
         config: dict = state.pop('config', None)
-        self.prog_it = config.get('prog_it', 0)
-        self.last_prog_si = config.get('last_prog_si', -1)
-        self.first_prog = config.get('first_prog', True)
         if config is not None:
+            self.prog_it = config.get('prog_it', 0)
+            self.last_prog_si = config.get('last_prog_si', -1)
+            self.first_prog = config.get('first_prog', True)
             for k, v in self.get_config().items():
                 if config.get(k, None) != v:
                     err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
-                    if strict: raise AttributeError(err)
-                    else: print(err)
+                    if strict:
+                        raise AttributeError(err)
+                    else:
+                        print(err)

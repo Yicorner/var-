@@ -97,15 +97,22 @@ def write_metrics_to_file(filename, metric_name, values, outCMD =False):
     with open(filename, "a") as f:
         f.write(f"{metric_name}: Mean = {get_value(mean_val)}, Max = {get_value(max_val)}, Min = {get_value(min_val)}\n")
 
-def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score_compare):
-    
-    V=args.vocab_size
-    Cvae=args.Ct5
-    ch=160
-    share_quant_resi=4
-    patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16) 
+def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=None, score_compare=None):
+    """Run SRVAR continuous AR inference and dump images for downstream metrics.
 
-    vae = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi, v_patch_nums=patch_nums).to(args.device)
+    `beam_search_nums`, `choose_min`, `score_compare` are retained for CLI compat
+    with the old discrete VAR but are NO-OPs in the continuous version.
+    """
+    Cvae = args.Ct5
+    ch = getattr(args, 'vae_ch', 128)
+    share_quant_resi = getattr(args, 'share_quant_resi', 4)
+    patch_nums = tuple(args.patch_nums) if hasattr(args, 'patch_nums') else (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+
+    vae = VQVAE(
+        vocab_size=0, z_channels=Cvae, ch=ch, test_mode=True,
+        share_quant_resi=share_quant_resi, v_patch_nums=patch_nums,
+        quant_resi=getattr(args, 'quant_resi', 0.5),
+    ).to(args.device)
     srvar_kw = dict(
         low_channel=args.Ct5, low_len=args.tlen,
         norm_eps=args.norm_eps, rms_norm=args.rms,
@@ -127,65 +134,70 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
         train_h_div_w_list=None,
         always_training_scales=args.always_training_scales,
         apply_spatial_patchify=args.apply_spatial_patchify,
-        block_chunks = args.block_chunks,
-        use_diff = args.use_diff,
-        use_ref = args.use_ref,
-
+        block_chunks=args.block_chunks,
+        use_ref=args.use_ref,
+        diffloss_w=getattr(args, 'diffloss_w', 1024),
+        diffloss_d=getattr(args, 'diffloss_d', 3),
+        diff_steps=str(getattr(args, 'diff_steps', '100')),
+        diffloss_batch_mul=getattr(args, 'diffloss_batch_mul', 4),
+        lr_cond_source=getattr(args, 'lr_cond_source', 'srvar_encoder'),
     )
-    if args.dp >= 0: srvar_kw['drop_path_rate'] = args.dp
-    if args.hd > 0: srvar_kw['num_heads'] = args.hd
+    if args.dp >= 0:
+        srvar_kw['drop_path_rate'] = args.dp
+    if args.hd > 0:
+        srvar_kw['num_heads'] = args.hd
+
     for ckpt_path_srvar in ckpt_paths:
-        vae.load_state_dict(torch.load(ckpt_path_srvar, map_location='cpu')['trainer']['vae_local'])
+        ckpt = torch.load(ckpt_path_srvar, map_location='cpu')
+        vae.load_state_dict(ckpt['trainer']['vae_local'])
         srvar_kw['vae_local'] = vae
         srvar: SRVAR = SRVAR(**srvar_kw)
         srvar = srvar.to(args.device)
-        srvar.load_state_dict(torch.load(ckpt_path_srvar, map_location='cpu')['trainer']['srvar_wo_ddp'])
+        srvar.load_state_dict(ckpt['trainer']['srvar_wo_ddp'], strict=False)
 
         srvar.eval()
         vae.eval()
-        
-        out_dir = os.path.join("metric_results",os.path.basename(ckpt_path_srvar))
-        predict_dir = os.path.join(out_dir,"predict")
-        gt_dir = os.path.join(out_dir,"gt")
-        os.makedirs(predict_dir,exist_ok=True)
-        os.makedirs(gt_dir,exist_ok=True)
-        
+
+        out_dir = os.path.join("metric_results", os.path.basename(ckpt_path_srvar))
+        predict_dir = os.path.join(out_dir, "predict")
+        gt_dir = os.path.join(out_dir, "gt")
+        os.makedirs(predict_dir, exist_ok=True)
+        os.makedirs(gt_dir, exist_ok=True)
+
         for idx, datas in tqdm(enumerate(ld_val), total=len(ld_val)):
-            if(idx>=maxtot and maxtot>0):
+            if idx >= maxtot and maxtot > 0:
                 break
             if args.use_ref:
                 inp_B3HW_low, inp_B3HW_super, ref_B3HW = datas
-            else :
+            else:
                 inp_B3HW_low, inp_B3HW_super = datas
                 ref_B3HW = None
-            
+
             inp_B3HW_low = inp_B3HW_low.to(dist.get_device(), non_blocking=True)
             inp_B3HW_super = inp_B3HW_super.to(dist.get_device(), non_blocking=True)
-            ref_B3HW = ref_B3HW.to(dist.get_device(), non_blocking=True) if ref_B3HW is not None else None
-            
-            B, V = inp_B3HW_low.shape[0], vae.vocab_size
-            
-            
-            gt_idx_Bl_super= vae.img_to_idxBl(inp_B3HW_super)
-            gt_BL_super = torch.cat(gt_idx_Bl_super, dim=1)
-            x_BLCv_wo_first_l_super= vae.quantize.idxBl_to_var_input(gt_idx_Bl_super)
-            
+            if ref_B3HW is not None:
+                ref_B3HW = ref_B3HW.to(dist.get_device(), non_blocking=True)
+            B = inp_B3HW_low.shape[0]
+
             h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
             T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
-            h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))
-            h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
-            scale_schedule = dynamic_resolution_h_w[h_div_w_template]["1M"]['scales']
-            scale_schedule = [ (min(t, T//4+1), h, w) for (t,h, w) in scale_schedule]
-            
+            keys = np.array(list(dynamic_resolution_h_w.keys()))
+            template = keys[np.argmin(np.abs(h_div_w - keys))]
+            scale_schedule = dynamic_resolution_h_w[template]["1M"]['scales']
+            scale_schedule = [(min(t, T // 4 + 1), h, w) for (t, h, w) in scale_schedule]
+            if len(scale_schedule) != len(patch_nums):
+                scale_schedule = [(1, pn, pn) for pn in patch_nums]
 
-            ret, idx_Bl_list, img = srvar.autoregressive_infer_cfg(vae=vae, inp_B3HW_low=inp_B3HW_low, ref_B3HW = ref_B3HW, 
-                                scale_schedule=scale_schedule,
-                                ret_img=True,
-                                B=B,
-                                choose_min=choose_min,
-                                score_compare=score_compare,
-                                beam_search_nums = beam_search_nums
-                                )
+            _, _, img = srvar.autoregressive_infer_cfg(
+                vae=vae,
+                inp_B3HW_low=inp_B3HW_low,
+                ref_B3HW=ref_B3HW,
+                scale_schedule=scale_schedule,
+                ret_img=True,
+                B=B,
+                cfg=getattr(args, 'cfg_infer', 1.0),
+                temperature=1.0,
+            )
 
             nup_test = img.detach().cpu().numpy()
             nup_gt = process_image(inp_B3HW_super)
@@ -193,8 +205,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums, choose_min,score
             for i in range(B):
                 _data = nup_gt[i]
                 _rec_B3HW = nup_test[i]
-                Image.fromarray(_rec_B3HW).save(os.path.join(predict_dir,f"{idx*B+i}.png"))
-                Image.fromarray(_data).save(os.path.join(gt_dir,f"{idx*B+i}.png"))
+                Image.fromarray(_rec_B3HW).save(os.path.join(predict_dir, f"{idx*B+i}.png"))
+                Image.fromarray(_data).save(os.path.join(gt_dir, f"{idx*B+i}.png"))
 
     
 
@@ -276,14 +288,24 @@ if __name__ == "__main__":
     args.device = "cuda"
 
     args.Ct5 = 32
-    args.vocab_size = 4096
+    args.vocab_size = 0   # continuous VAE; no codebook
     args.data_path = "../vaex/data/mix_data/"
     maxtot = 5
-    args.use_diff = False
+    args.use_diff = True
     args.use_ref = False
+    args.patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    args.vae_ch = 128
+    args.quant_resi = 0.5
+    args.share_quant_resi = 4
+    args.diffloss_w = 1024
+    args.diffloss_d = 3
+    args.diff_steps = "100"
+    args.diffloss_batch_mul = 4
+    args.cfg_infer = 1.0
+    args.lr_cond_source = 'srvar_encoder'
     out_path = "./metric.txt"
 
-
+    # Legacy args kept for `metric()`'s file-naming compatibility.
     beam_search_nums = 0
     choose_min = "max"
     score_compare = "max"
