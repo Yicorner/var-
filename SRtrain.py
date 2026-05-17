@@ -187,7 +187,9 @@ def build_everything(args: arg_util.Args):
     }
     names, paras, para_groups = filter_params(srvar_wo_ddp, ndim_dict, nowd_keys=nowd_keys)
     del ndim_dict
-    if '_' in args.ada:
+    if not args.ada:
+        beta0, beta1 = 0.9, 0.999  # AdamW defaults when --ada is omitted
+    elif '_' in args.ada:
         beta0, beta1 = map(float, args.ada.split('_'))
     else:
         beta0, beta1 = float(args.ada), -1

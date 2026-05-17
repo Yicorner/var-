@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -72,7 +72,7 @@ class Args(Tap):
     # data
     patch_size: int = 16
     # patch_nums: tuple = (1,3,5,8,12,16)    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
-    patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16) 
+    patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16) 
     
     hflip: bool = False         # augmentation: horizontal flip
     
@@ -321,6 +321,8 @@ def init_dist_and_get_args():
     
     # update args: data loading
     args.device = dist.get_device()
+    # CLI `--patch_nums 1 2 3 ...` is parsed as strings by Tap; coerce once here.
+    args.patch_nums = tuple(int(p) for p in args.patch_nums)
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
     
     # update args: bs and lr

@@ -156,9 +156,10 @@ EXP_NOTE="cond and scale[0] don't depend on LR_VAE"
 LR_FOLDER=LR \
 SAME_SHAPE=False \
 DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
-VAE_CKPT=local_output/stage2/ckpt-best.pth \
+VAE_CKPT=/home/featurize/work/myvaex/local_output/test/test_stage2_with_alignment_epoch3/ckpt-2.pth \
 PATCH_NUMS_STR="4 5 6 8 10 13 16" \
 RECON_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE \
 VAL_AND_SAVING_PER_EP=1 \
+VAE_CH=160 \
 bash SRtrain.sh
 ```
