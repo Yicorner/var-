@@ -146,3 +146,19 @@ PSNR / SSIM 与 myvaex 完全一致：RGB 通道、[0,1]、`skimage.metrics`，`
 - `vae_ckpt` 优先从 `ckpt['trainer']['vae_ema']` 读取，fallback 到 `vae_wo_ddp` / `vae`。
 - `stage1_ckpt` 优先从 `ckpt['trainer']['lr_vae_ema']` 读取，fallback 到 `lr_vae_wo_ddp` / `lr_vae`。
 - 无 `trainer` 顶层 key 时，按裸 `state_dict` 处理（兼容 `eval_stage1_ckpt.py` 的导出格式）。
+
+
+
+##
+```bash
+EXP_NAME=srvar_lr256_baseline\
+EXP_NOTE="cond and scale[0] don't depend on LR_VAE"
+LR_FOLDER=LR \
+SAME_SHAPE=False \
+DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
+VAE_CKPT=local_output/stage2/ckpt-best.pth \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+RECON_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE \
+VAL_AND_SAVING_PER_EP=1 \
+bash SRtrain.sh
+```
