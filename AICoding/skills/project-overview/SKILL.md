@@ -87,7 +87,7 @@ var/
 
 - `vae.img_to_ms_continuous_input(img_HR) -> (ms_h_target, ms_x_input, f_hat_full)`
   - `ms_h_target`: list of `[B, C, pn, pn]`，每个 scale 的 `posterior.mode()`，作为 DiffLoss 目标。
-  - `ms_x_input`: `[B, L-1, C]`，teacher forcing 输入（与离散版 `idxBl_to_var_input` 同形）。
+  - `ms_x_input`: `[B, L-first_l, C]`，teacher forcing 输入（与离散版 `idxBl_to_var_input` 同形）。`first_l = patch_nums[0]^2`，不是固定 1。
 - `vae.fhat_to_img(f_hat) -> [-1,1]` 图像。
 - `vae.quantize.get_next_autoregressive_input(si, SN, accu_BChw, h_BChw)`：推理用，累积 + 下采样到下一尺度。
 
@@ -103,8 +103,8 @@ LR --> encoder/quant_conv  (或 LR_VAE) --> low_f [B, low_len, C]
                                             +--> TextAttentivePool -> SOS / cond_BD
                                             +--> low_proj_for_ca -> CrossAttn KV
 
-ms_x_input [B, L-1, C] -> word_embed -> [B, L-1, D]
-SOS [B,1,D] cat embed -> [B, L, D] -> Self-Attn (block-causal) + CrossAttn -> z [B, L, D]
+ms_x_input [B, L-first_l, C] -> word_embed -> [B, L-first_l, D]
+SOS [B,first_l,D] cat embed -> [B, L, D] -> Self-Attn (block-causal) + CrossAttn -> z [B, L, D]
 
 z -> reshape(B*L, D) ----+
 ms_h_target -> [B*L, C] -+--> DiffLoss(target, z) -> scalar loss

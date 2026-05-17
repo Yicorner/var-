@@ -30,7 +30,7 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
 
   ms_x_input = cat over si in 0..SN-2 of:
       F.interpolate(f_hat_cum_at_end_of_si, (pn_{si+1}, pn_{si+1}), 'area').view(B,C,-1).transpose(1,2)
-  # ms_x_input shape: [B, L-1, C]，L = sum(pn^2)
+  # ms_x_input shape: [B, L-first_l, C]，L=sum(pn^2)，first_l=patch_nums[0]^2
 
 [SRVAR 侧]
   low_f = encoder_path(LR)                                # [B, low_len, C]
@@ -41,7 +41,7 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
   sos = cond_BD = low_proj_for_sos(kv_compact)            # [B, D]
   ca_kv = (low_proj_for_ca(kv_compact), cu_seqlens_k, max_seqlen_k)
 
-  sos = sos.unsqueeze(1) + pos_start                      # [B, 1, D]
+  sos = sos.unsqueeze(1).expand(B, first_l, D) + pos_start # [B, first_l, D]
   x_BLC = cat([sos, word_embed(norm0_ve(ms_x_input))],1)  # [B, L, D]
   x_BLC = add_lvl_embeding_for_x_BLC(x_BLC, scale_schedule)
   x_BLC -> SelfAttn(block-causal mask per scale) + CrossAttn(ca_kv) ...
@@ -69,7 +69,8 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
 low_f = encoder_path(LR)              # 同上
 ca_kv = build_kv(low_f)
 sos = pool(low_f) + pos_start
-last_stage = sos.unsqueeze(1)         # [B, 1, D]
+first_l = scale_schedule[0][0] * scale_schedule[0][1] * scale_schedule[0][2]
+last_stage = sos.unsqueeze(1).expand(B, first_l, D)  # [B, first_l, D]
 accu_BChw = zeros(B, Cvae, 16, 16)
 
 for si, (t, h, w) in enumerate(scale_schedule):

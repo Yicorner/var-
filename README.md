@@ -123,7 +123,7 @@ PSNR / SSIM 与 myvaex 完全一致：RGB 通道、[0,1]、`skimage.metrics`，`
 | `patch_nums` | 必须与 stage2 ckpt 一致 |
 | `lr_folder` × `lr_cond_source` | `LR_COND_SOURCE=lr_vae` 强制 `LR_FOLDER=LR_64x64` 且 `STAGE1_CKPT` 非空 |
 | `tlen` | `cfg_uncond` buffer 长度，需 `>= low_len`（`LR_64`→16，`LR_256`→256） |
-| `patch_nums[0]` | 启用 stage1 时必须等于 `lr_img_size/16`（默认 4） |
+| `patch_nums[0]` | 非 stage1 时可以是 `1` 或 `4`；SRVAR 会展开 `patch_nums[0]^2` 个 SOS 起始 token。启用 stage1 时必须等于 `lr_img_size/16`（默认 4） |
 | DiffLoss train / gen | 训练 1000 步 cosine IDDPM；推理 spaced 步数 (默认 100) |
 | `same_shape` | 默认 `False`，LR 原样喂入；`True` 会把 LR bicubic 上采样到 HR，仅 legacy 兼容 |
 
@@ -149,10 +149,11 @@ PSNR / SSIM 与 myvaex 完全一致：RGB 通道、[0,1]、`skimage.metrics`，`
 
 
 
-##
+## 8. LR_256 baseline quick command
+
 ```bash
-EXP_NAME=srvar_lr256_baseline\
-EXP_NOTE="cond and scale[0] don't depend on LR_VAE"
+EXP_NAME=srvar_lr256_baseline \
+EXP_NOTE="cond and scale[0] don't depend on LR_VAE" \
 LR_FOLDER=LR \
 SAME_SHAPE=False \
 DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \

@@ -181,7 +181,11 @@ class SRVAR(nn.Module):
             print(info, flush=True)
         
         self.raw_scale_schedule = raw_scale_schedule    # 'raw' means before any patchifying
-        self.first_l = 1
+        # The first autoregressive segment is not always a single token.  When
+        # `patch_nums[0] == 4`, for example, scale[0] has 16 target tokens, so
+        # the SOS conditioning token must be expanded to 16 positions to keep
+        # x_BLC, the attention mask, and the DiffLoss target aligned.
+        self.first_l = raw_scale_schedule[0] ** 2
         self.begin_ends = []
         cur = 0
         for i, pn in enumerate(self.raw_scale_schedule):
@@ -545,7 +549,12 @@ class SRVAR(nn.Module):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
 
         # ---- 2. AR loop ----
-        last_stage = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+        first_l = int(scale_schedule[0][0] * scale_schedule[0][1] * scale_schedule[0][2])
+        assert first_l == self.first_l, (
+            f'first scale token count {first_l} != model first_l={self.first_l}; '
+            f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
+        )
+        last_stage = sos.unsqueeze(1).expand(B, first_l, -1) + self.pos_start.expand(B, first_l, -1)
         accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
         num_stages_minus_1 = len(scale_schedule) - 1
         need_to_pad = 0
@@ -567,8 +576,8 @@ class SRVAR(nn.Module):
                     si=si, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss,
                     ca_kv=ca_kv, scale_schedule=scale_schedule,
                     B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True,
-                )                                                       # [B, pn, D]
-                z_BlD = self.get_logits(BlV[:B], cond_BD[:B])           # [B, pn, D]
+                )                                                       # [B, pn_tokens, D]
+                z_BlD = self.get_logits(BlV[:B], cond_BD[:B])           # [B, pn_tokens, D]
 
                 # Per-token DiffLoss sampling.
                 z_flat = z_BlD.reshape(-1, z_BlD.shape[-1]).contiguous() # [B*pn, D]
@@ -640,9 +649,9 @@ class SRVAR(nn.Module):
                             `lr_cond_source='srvar_encoder'`.
             ms_h_target:    list of `[B, C, pn, pn]` per-scale posterior means; the
                             DiffLoss targets.
-            ms_x_input:     `[B, L-1, C]` teacher-forcing continuous tokens (already
-                            comes from VAE's `f_to_var_input_continuous`). May be
-                            `None` if `len(scale_schedule)==1`.
+            ms_x_input:     `[B, L-first_l, C]` teacher-forcing continuous tokens
+                            (already comes from VAE's `f_to_var_input_continuous`).
+                            May be `None` if `len(scale_schedule)==1`.
             scale_schedule: list of (t, h, w) per scale.
             ref_B3HW:       optional reference image (use_ref=True only).
             low_f_override: `[B, low_len, C]` raw LR tokens; required when
@@ -694,8 +703,26 @@ class SRVAR(nn.Module):
 
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()
 
-            # ---- 2. build x_BLC = [SOS, word_embed(ms_x_input)] ----
-            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+            # ---- 2. build x_BLC = [SOS_for_scale0, word_embed(ms_x_input)] ----
+            target_l = sum(int(pn[0] * pn[1] * pn[2]) for pn in scale_schedule)
+            first_l = int(scale_schedule[0][0] * scale_schedule[0][1] * scale_schedule[0][2])
+            assert first_l == self.first_l, (
+                f'first scale token count {first_l} != model first_l={self.first_l}; '
+                f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
+            )
+            expected_ms_x_l = target_l - first_l
+            if ms_x_input is not None:
+                assert ms_x_input.shape[1] == expected_ms_x_l, (
+                    f'ms_x_input length {ms_x_input.shape[1]} != expected L-first_l '
+                    f'{expected_ms_x_l}; target_l={target_l}, first_l={first_l}, '
+                    f'scale_schedule={scale_schedule}'
+                )
+            else:
+                assert expected_ms_x_l == 0, (
+                    f'ms_x_input=None but scale_schedule has {expected_ms_x_l} '
+                    f'teacher-forcing tokens after scale[0].'
+                )
+            sos = sos.unsqueeze(1).expand(B, first_l, -1) + self.pos_start.expand(B, first_l, -1)
             if ms_x_input is not None:
                 x_BLC = torch.cat(
                     (sos, self.word_embed(self.norm0_ve(ms_x_input))), dim=1
@@ -704,6 +731,10 @@ class SRVAR(nn.Module):
                 x_BLC = sos
 
             l_end = x_BLC.shape[1]
+            assert l_end == target_l, (
+                f'x_BLC length {l_end} != target token count {target_l}; '
+                f'first_l={first_l}, ms_x_input={None if ms_x_input is None else tuple(ms_x_input.shape)}'
+            )
             need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end
 
             if self.use_flex_attn:

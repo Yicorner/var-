@@ -73,7 +73,7 @@ DATA_PATH/
 - 此时 `patch_nums[0]` 必须等于该边长（默认必须是 4）。
 - 启动时 assert：`assert lr_vae.encode_to_posterior_mean(lr_64).shape[-1] == patch_nums[0]`。
 
-如果只是 `srvar_encoder` 走 KV，没有覆盖 target，`patch_nums[0]` 不受 LR 约束（可以保留 `1` 起步，最小尺度由 SOS 预测）。
+如果只是 `srvar_encoder` 走 KV，没有覆盖 target，`patch_nums[0]` 不受 LR 约束（可以保留 `1` 起步，也可以从 `4` 起步）。SRVAR 会把 SOS 扩展成 `patch_nums[0]^2` 个起始 token；因此 `(4,5,6,8,10,13,16)` 下训练输入长度是 `16 + (L-16) = L`，不会再出现 attention mask 长度与 `ms_x_input` 长度错位。
 
 ---
 
