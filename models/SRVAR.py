@@ -278,7 +278,15 @@ class SRVAR(nn.Module):
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         # TODO:Neesky 是否考虑修改，不知道啥用
         if self.rope2d_each_sa_layer:
-            rope2d_freqs_grid = precompute_rope2d_freqs_grid(dim=self.C//self.num_heads, dynamic_resolution_h_w=dynamic_resolution_h_w, pad_to_multiplier=self.pad_to_multiplier, rope2d_normalized_by_hw=self.rope2d_normalized_by_hw)
+            # SRtrainer may fall back to [(1,pn,pn)] when patch_nums != dynamic_resolution template length.
+            fallback_scale_schedule = tuple((1, pn, pn) for pn in raw_scale_schedule)
+            rope2d_freqs_grid = precompute_rope2d_freqs_grid(
+                dim=self.C // self.num_heads,
+                dynamic_resolution_h_w=dynamic_resolution_h_w,
+                pad_to_multiplier=self.pad_to_multiplier,
+                rope2d_normalized_by_hw=self.rope2d_normalized_by_hw,
+                extra_scale_schedules=[fallback_scale_schedule],
+            )
             self.rope2d_freqs_grid = rope2d_freqs_grid
         else:
             raise ValueError(f'self.rope2d_each_sa_layer={self.rope2d_each_sa_layer} not implemented')

@@ -35,61 +35,110 @@ except ImportError:
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
 
-def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0):
-    # split the dimension into half, one for x and one for y
+def _make_freqs_grid_map(dim, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0):
     half_dim = dim // 2
-    inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.int64).float().to(device) / half_dim)) # namely theta, 1 / (10000^(i/half_dim)), i=0,2,..., half_dim-2
+    inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.int64).float().to(device) / half_dim))
     t_height = torch.arange(max_height, device=device, dtype=torch.int64).type_as(inv_freq)
     t_width = torch.arange(max_width, device=device, dtype=torch.int64).type_as(inv_freq)
     t_height = t_height / scaling_factor
-    freqs_height = torch.outer(t_height, inv_freq)  # (max_height, dim / (1 for 1d, 2 for 2d, 3 for 3d) / 2), namely y*theta
+    freqs_height = torch.outer(t_height, inv_freq)
     t_width = t_width / scaling_factor
-    freqs_width = torch.outer(t_width, inv_freq)  # (max_width, dim / (1 for 1d, 2 for 2d, 3 for 3d) / 2), namely x*theta
+    freqs_width = torch.outer(t_width, inv_freq)
     freqs_grid_map = torch.concat([
-        freqs_height[:, None, :].expand(-1, max_width, -1), # (max_height, max_width, dim / (1 for 1d, 2 for 2d, 3 for 3d) / 2)
-        freqs_width[None, :, :].expand(max_height, -1, -1), # (max_height, max_width, dim / (1 for 1d, 2 for 2d, 3 for 3d) / 2)
-    ], dim=-1)  # (max_height, max_width, dim / (1 for 1d, 2 for 2d, 3 for 3d))
-    freqs_grid_map = torch.stack([torch.cos(freqs_grid_map), torch.sin(freqs_grid_map)], dim=0)
-    # (2, max_height, max_width, dim / (1 for 1d, 2 for 2d, 3 for 3d))
+        freqs_height[:, None, :].expand(-1, max_width, -1),
+        freqs_width[None, :, :].expand(max_height, -1, -1),
+    ], dim=-1)
+    return torch.stack([torch.cos(freqs_grid_map), torch.sin(freqs_grid_map)], dim=0)
+
+
+def _build_rope2d_cache_from_schedule(
+    freqs_grid_map, scale_schedule, rope2d_normalized_by_hw, pad_to_multiplier, half_dim,
+):
+    scale_schedule = list(scale_schedule)
+    _, ph, pw = scale_schedule[-1]
+    max_edge_length = freqs_grid_map.shape[1]
+    if ph >= pw:
+        uph, upw = max_edge_length, int(max_edge_length / ph * pw)
+    else:
+        uph, upw = int(max_edge_length / pw * ph), max_edge_length
+    rope_cache_list = []
+    for (_, ph, pw) in scale_schedule:
+        ph_mul_pw = ph * pw
+        if rope2d_normalized_by_hw == 1:
+            rope_cache = F.interpolate(
+                freqs_grid_map[:, :uph, :upw, :].permute([0, 3, 1, 2]),
+                size=(ph, pw), mode='bilinear', align_corners=True,
+            )
+            rope_cache = rope_cache.permute([0, 2, 3, 1])
+        elif rope2d_normalized_by_hw == 2:
+            _, uph, upw = scale_schedule[-1]
+            indices = torch.stack([
+                (torch.arange(ph) * (uph / ph)).reshape(ph, 1).expand(ph, pw),
+                (torch.arange(pw) * (upw / pw)).reshape(1, pw).expand(ph, pw),
+            ], dim=-1).round().int()
+            indices = indices.reshape(-1, 2)
+            rope_cache = freqs_grid_map[:, indices[:, 0], indices[:, 1], :]
+            rope_cache = rope_cache.reshape(2, ph, pw, -1)
+        elif rope2d_normalized_by_hw == 0:
+            rope_cache = freqs_grid_map[:, :ph, :pw, :]
+        else:
+            raise ValueError(f'Unknown rope2d_normalized_by_hw: {rope2d_normalized_by_hw}')
+        rope_cache_list.append(rope_cache.reshape(2, ph_mul_pw, -1))
+    cat_rope_cache = torch.cat(rope_cache_list, 1)
+    if cat_rope_cache.shape[1] % pad_to_multiplier:
+        pad = torch.zeros(2, pad_to_multiplier - cat_rope_cache.shape[1] % pad_to_multiplier, half_dim)
+        cat_rope_cache = torch.cat([cat_rope_cache, pad], dim=1)
+    return cat_rope_cache[:, None, None, None]
+
+
+def register_rope2d_schedule(
+    rope2d_freqs_grid, scale_schedule, dim, rope2d_normalized_by_hw,
+    pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16,
+    base=10000.0, device=None, scaling_factor=1.0,
+):
+    """Add RoPE cache for an arbitrary (t,h,w) scale schedule if not already present."""
+    tmp_scale_schedule = tuple(
+        (item[0], item[1], item[2]) if len(item) == 3 else (1, item[0], item[1])
+        for item in scale_schedule
+    )
+    key = str(tmp_scale_schedule)
+    if key in rope2d_freqs_grid:
+        return rope2d_freqs_grid
+    half_dim = dim // 2
+    freqs_grid_map = _make_freqs_grid_map(
+        dim, max_height=max_height, max_width=max_width,
+        base=base, device=device, scaling_factor=scaling_factor,
+    )
+    rope2d_freqs_grid[key] = _build_rope2d_cache_from_schedule(
+        freqs_grid_map, tmp_scale_schedule, rope2d_normalized_by_hw, pad_to_multiplier, half_dim,
+    )
+    return rope2d_freqs_grid
+
+
+def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0, extra_scale_schedules=None):
+    half_dim = dim // 2
+    freqs_grid_map = _make_freqs_grid_map(
+        dim, max_height=max_height, max_width=max_width,
+        base=base, device=device, scaling_factor=scaling_factor,
+    )
 
     rope2d_freqs_grid = {}
     for h_div_w in dynamic_resolution_h_w:
         scale_schedule = dynamic_resolution_h_w[h_div_w]['1M']['scales']
-        _, ph, pw = scale_schedule[-1]
-        max_edge_length = freqs_grid_map.shape[1]
-        if ph >= pw:
-            uph, upw = max_edge_length, int(max_edge_length / ph * pw)
-        else:
-            uph, upw = int(max_edge_length / pw * ph), max_edge_length
-        rope_cache_list = []
-        for (_, ph, pw) in scale_schedule:
-            ph_mul_pw = ph * pw
-            if rope2d_normalized_by_hw == 1: # downsample
-                rope_cache = F.interpolate(freqs_grid_map[:, :uph, :upw, :].permute([0,3,1,2]), size=(ph, pw), mode='bilinear', align_corners=True)
-                rope_cache = rope_cache.permute([0,2,3,1]) # (2, ph, pw, half_head_dim)
-            elif rope2d_normalized_by_hw == 2: # star stylee
-                _, uph, upw = scale_schedule[-1]
-                indices = torch.stack([
-                    (torch.arange(ph) * (uph / ph)).reshape(ph, 1).expand(ph, pw),
-                    (torch.arange(pw) * (upw / pw)).reshape(1, pw).expand(ph, pw),
-                ], dim=-1).round().int() # (ph, pw, 2)
-                indices = indices.reshape(-1, 2) # (ph*pw, 2)
-                rope_cache = freqs_grid_map[:, indices[:,0], indices[:,1], :] # (2, ph*pw, half_head_dim)
-                rope_cache = rope_cache.reshape(2, ph, pw, -1)
-            elif rope2d_normalized_by_hw == 0:
-                rope_cache = freqs_grid_map[:, :ph, :pw, :] # (2, ph, pw, half_head_dim)
-            else:
-                raise ValueError(f'Unknown rope2d_normalized_by_hw: {rope2d_normalized_by_hw}')
-            rope_cache_list.append(rope_cache.reshape(2, ph_mul_pw, -1))
-        cat_rope_cache = torch.cat(rope_cache_list, 1) # (2, seq_len, half_head_dim)
-        if cat_rope_cache.shape[1] % pad_to_multiplier:
-            pad = torch.zeros(2, pad_to_multiplier - cat_rope_cache.shape[1] % pad_to_multiplier, half_dim)
-            cat_rope_cache = torch.cat([cat_rope_cache, pad], dim=1)
-        cat_rope_cache = cat_rope_cache[:,None,None,None] # (2, 1, 1, 1, seq_len, half_dim)
+        cat_rope_cache = _build_rope2d_cache_from_schedule(
+            freqs_grid_map, scale_schedule, rope2d_normalized_by_hw, pad_to_multiplier, half_dim,
+        )
         for pn in dynamic_resolution_h_w[h_div_w]:
             scale_schedule = dynamic_resolution_h_w[h_div_w][pn]['scales']
             tmp_scale_schedule = [(1, h, w) for _, h, w in scale_schedule]
             rope2d_freqs_grid[str(tuple(tmp_scale_schedule))] = cat_rope_cache
+    if extra_scale_schedules:
+        for scale_schedule in extra_scale_schedules:
+            register_rope2d_schedule(
+                rope2d_freqs_grid, scale_schedule, dim, rope2d_normalized_by_hw,
+                pad_to_multiplier=pad_to_multiplier, max_height=max_height, max_width=max_width,
+                base=base, device=device, scaling_factor=scaling_factor,
+            )
     return rope2d_freqs_grid
 
 

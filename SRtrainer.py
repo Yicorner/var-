@@ -24,6 +24,9 @@ from utils.misc import MetricLogger, TensorboardLogger
 Ten = torch.Tensor
 
 
+_scale_schedule_fallback_warned = False
+
+
 def _resolve_scale_schedule(
     inp_low: torch.Tensor,
     patch_nums: Tuple[int, ...],
@@ -43,8 +46,10 @@ def _resolve_scale_schedule(
     scales = [(min(t, T // 4 + 1), h, w) for (t, h, w) in scales]
     if len(scales) != len(patch_nums):
         scales = [(1, pn, pn) for pn in patch_nums]
-        if dist.is_master():
+        global _scale_schedule_fallback_warned
+        if dist.is_master() and not _scale_schedule_fallback_warned:
             print(f'[scale_schedule] fallback to [(1,pn,pn)]; patch_nums={patch_nums}')
+            _scale_schedule_fallback_warned = True
     else:
         for i, (t, h, w) in enumerate(scales):
             assert h == patch_nums[i] and w == patch_nums[i], \
@@ -93,6 +98,13 @@ class SRVARTrainer(object):
 
         # Tracks whether we've already written the `run_metadata.json` for this run.
         self._reconstruction_metadata_written: bool = False
+        # Resolved once per run (LR spatial size is fixed for paired SR training).
+        self._cached_scale_schedule: Optional[List[Tuple[int, int, int]]] = None
+
+    def _get_scale_schedule(self, inp_B3HW_low: Ten) -> List[Tuple[int, int, int]]:
+        if self._cached_scale_schedule is None:
+            self._cached_scale_schedule = _resolve_scale_schedule(inp_B3HW_low, self.patch_nums)
+        return self._cached_scale_schedule
 
     # ----------------------------------------------------------------- helpers
     def _build_targets(self, inp_B3HW_super: Ten):
@@ -159,7 +171,7 @@ class SRVARTrainer(object):
 
             ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
             ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
-            scale_schedule = _resolve_scale_schedule(inp_B3HW_low, self.patch_nums)
+            scale_schedule = self._get_scale_schedule(inp_B3HW_low)
 
             loss = self.srvar(
                 inp_B3HW_low=inp_B3HW_low,
@@ -272,7 +284,7 @@ class SRVARTrainer(object):
         B = inp_B3HW_low.shape[0]
         ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
         ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
-        scale_schedule = _resolve_scale_schedule(inp_B3HW_low, self.patch_nums)
+        scale_schedule = self._get_scale_schedule(inp_B3HW_low)
 
         with self.var_opt.amp_ctx:
             loss = self.srvar(
