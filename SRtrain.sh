@@ -46,8 +46,10 @@ SKIP_SCALE0_LOSS=${SKIP_SCALE0_LOSS:-${skip_scale0_loss:-False}}
 # -------- training --------
 EP=${EP:-${ep:-50}}
 BS=${BS:-${bs:-4}}
+AC=${AC:-${ac:-1}}
 LR=${LR:-${tblr:-3e-4}}
 WD=${WD:-${twd:-0.05}}
+WP=${WP:-${wp:-0}}
 GRAD_CLIP=${GRAD_CLIP:-${tclip:-2.0}}
 FP16=${FP16:-${fp16:-1}}
 TLEN=${TLEN:-${tlen:-1024}}
@@ -57,6 +59,8 @@ DIFFLOSS_W=${DIFFLOSS_W:-${diffloss_w:-1024}}
 DIFFLOSS_D=${DIFFLOSS_D:-${diffloss_d:-3}}
 DIFF_STEPS=${DIFF_STEPS:-${diff_steps:-100}}
 DIFFLOSS_BATCH_MUL=${DIFFLOSS_BATCH_MUL:-${diffloss_batch_mul:-4}}
+SCALE_LOSS_WEIGHTING=${SCALE_LOSS_WEIGHTING:-${scale_loss_weighting:-token}}
+SCALE0_QUERY_SOURCE=${SCALE0_QUERY_SOURCE:-${scale0_query_source:-sos}}
 
 # -------- CFG --------
 CFG=${CFG:-${cfg:-0.1}}              # training-time condition dropout rate
@@ -105,12 +109,14 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --tlen="$TLEN" \
   --pn="1M" --rope2d_normalized_by_hw=2 --rope2d_each_sa_layer=1 \
   --enable_checkpointing="full-block" \
-  --bs="$BS" --ep="$EP" --tblr="$LR" --twd="$WD" --tclip="$GRAD_CLIP" \
+  --bs="$BS" --ac="$AC" --ep="$EP" --tblr="$LR" --twd="$WD" --wp="$WP" --tclip="$GRAD_CLIP" \
   --fp16="$FP16" --tini=-1 \
   --val_and_saving_per_ep="$VAL_AND_SAVING_PER_EP" \
   --cfg="$CFG" --cfg_infer="$CFG_INFER" \
   --diffloss_w="$DIFFLOSS_W" --diffloss_d="$DIFFLOSS_D" \
   --diff_steps="$DIFF_STEPS" --diffloss_batch_mul="$DIFFLOSS_BATCH_MUL" \
+  --scale_loss_weighting="$SCALE_LOSS_WEIGHTING" \
+  --scale0_query_source="$SCALE0_QUERY_SOURCE" \
   --save_reconstruction_images=True \
   --reconstruction_save_interval="$RECON_SAVE_INTERVAL" \
   --reconstruction_max_samples="$RECON_MAX_SAMPLES" \

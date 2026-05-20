@@ -124,6 +124,8 @@ MAR 是 **单尺度**（一张图一个 token 网格），var 是 **多尺度**�
 - token 总数 `L = sum_i pn_i^2`，跨尺度共享同一个 `SimpleMLPAdaLN`；通道维都是 `Cvae`，可以共享。
 - `lvl_embed`（`SRVAR.py` 里已有）加在 transformer 输入上，**已经把尺度信息编码到了 z 里**，所以 DiffLoss 本身不需要再喂 scale id。
 - 推理时按 scale 顺序逐个 sample，与离散 VAR 推理结构相同。
+- 当 `scale_loss_weighting=equal_scale` 时，每个 scale 先按 token 求平均，再跨 scale 平均，避免 `4x4` scale0 在 `16/666` token 权重下过弱。
+- 当 `scale0_query_source=low_f_pool` 时，scale[0] 的 query 来自 normalized LR token grid 的 adaptive pooling + linear projection，再加 global SOS 和 `pos_start`；train/infer 共用同一个 helper。
 
 ---
 
@@ -148,5 +150,7 @@ MAR 是 **单尺度**（一张图一个 token 网格），var 是 **多尺度**�
 | `depth` (`diffloss_d`) | 3 | MAR 的 large 默认 |
 | `num_sampling_steps` (`diff_steps`) | 100 | 推理子序列长度 |
 | `diffloss_batch_mul` | 4 | DiffLoss 内 N 维 repeat |
+| `scale_loss_weighting` | `token` | 可设 `equal_scale` 强化小尺度监督 |
+| `scale0_query_source` | `sos` | 可设 `low_f_pool` 让 scale0 query 依赖 LR token |
 | `cond_drop_rate` | 0.1 | 训练 CFG dropout |
 | `cfg_infer` | 1.0 | 推理 CFG scale（>1 增强条件） |

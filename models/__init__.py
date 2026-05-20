@@ -58,6 +58,8 @@ def build_vae_srvar(
         diffloss_d=getattr(args, 'diffloss_d', 3),
         diff_steps=str(getattr(args, 'diff_steps', '100')),
         diffloss_batch_mul=getattr(args, 'diffloss_batch_mul', 4),
+        scale_loss_weighting=getattr(args, 'scale_loss_weighting', 'token'),
+        scale0_query_source=getattr(args, 'scale0_query_source', 'sos'),
         # ---- LR conditioning source ----
         lr_cond_source=getattr(args, 'lr_cond_source', 'srvar_encoder'),
     )

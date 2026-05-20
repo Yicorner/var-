@@ -155,6 +155,7 @@ bash SRtrain.sh
 - `VAE_oracle` 是用 HR 经冻结 VAE 得到的 target latent 直接 decode，代表这份 VAE ckpt 的重建上限。
 - `AR_scale0_only` 是只跑第 0 个 AR scale 的 diffusion sampling，把这个 coarse latent 上采样/累积后直接 decode，用来判断 scale[0] 起步是否已经坏掉。
 - stdout 会打印 `[diagnostics ...]` 和 `[diagnostics latent]`，包含 AR / scale0 / oracle 的 PSNR、SSIM 和 target/sample latent 的 mean/std/min/max。
+- 启动日志会打印 `scale0_query_source`、`scale_loss_weighting` 和 DiffLoss final layer norm；新实验建议检查 final layer norm 为 0 或接近 0。
 
 ---
 
@@ -179,6 +180,33 @@ PATCH_NUMS_STR="4 5 6 8 10 13 16" \
 RECON_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE \
 VAL_AND_SAVING_PER_EP=1 \
 VAE_CH=160 \
+bash SRtrain.sh
+```
+
+### 8.1 Round3 推荐短跑
+
+这条命令启用 LR-conditioned scale0 query、equal-scale DiffLoss weighting，并用 gradient accumulation 保持 microbatch 约 4、实际 peak `tlr≈1e-4`。不要从旧噪声 run resume。
+
+```bash
+EXP_NAME=srvar_scale0_lrq_equal_loss \
+EXP_NOTE="LR-conditioned scale0 query + equal-scale DiffLoss" \
+LR_FOLDER=LR \
+SAME_SHAPE=False \
+DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
+VAE_CKPT=/home/featurize/work/myvaex/local_output/test/test_stage2_with_alignment_epoch3/ckpt-2.pth \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+RECON_DIR_NAME=scale0_lrq_equal_loss \
+VAL_AND_SAVING_PER_EP=1 \
+VAE_CH=160 \
+BS=256 \
+AC=64 \
+LR=1e-4 \
+WP=0.05 \
+SCALE0_QUERY_SOURCE=low_f_pool \
+SCALE_LOSS_WEIGHTING=equal_scale \
+TRAIN_LOG_POINTS_PER_EPOCH=64 \
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_INTERVAL=500 \
 bash SRtrain.sh
 ```
 

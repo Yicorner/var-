@@ -51,6 +51,8 @@ class Args(Tap):
     diffloss_d: int = 3
     diff_steps: str = '100'             # inference sampling steps (spaced IDDPM)
     diffloss_batch_mul: int = 4         # per-token MAR-style batch multiplier
+    scale_loss_weighting: str = 'token' # 'token' or 'equal_scale'
+    scale0_query_source: str = 'sos'    # 'sos' or 'low_f_pool'
     cfg_infer: float = 1.0              # inference CFG scale (>1 sharpens condition)
     # Reconstruction visualization / metadata
     save_reconstruction_images: bool = True
@@ -335,6 +337,7 @@ def init_dist_and_get_args():
     bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())
     args.batch_size = bs_per_gpu
     args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size() # bs为一轮的bs，原先的是附加上ac的bs
+    args.r_accu = 1.0 / args.ac
     args.workers = min(max(0, args.workers), args.batch_size)
     
     args.tlr = args.ac * args.tblr * args.glb_batch_size / 256

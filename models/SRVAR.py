@@ -115,6 +115,8 @@ class SRVAR(nn.Module):
         diffloss_d: int = 3,
         diff_steps: str = "100",
         diffloss_batch_mul: int = 4,
+        scale_loss_weighting: str = 'token',
+        scale0_query_source: str = 'sos',
         # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
         lr_cond_source: str = 'srvar_encoder',
     ):
@@ -243,6 +245,12 @@ class SRVAR(nn.Module):
         # new training path always uses the DiffLoss head below regardless.
         self.use_diff = True
         self.diffloss_batch_mul = int(max(1, diffloss_batch_mul))
+        assert scale_loss_weighting in ('token', 'equal_scale'), \
+            f"scale_loss_weighting must be 'token' or 'equal_scale', got {scale_loss_weighting!r}"
+        assert scale0_query_source in ('sos', 'low_f_pool'), \
+            f"scale0_query_source must be 'sos' or 'low_f_pool', got {scale0_query_source!r}"
+        self.scale_loss_weighting = scale_loss_weighting
+        self.scale0_query_source = scale0_query_source
 
         self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
@@ -273,6 +281,7 @@ class SRVAR(nn.Module):
             nn.GELU(approximate='tanh'),
             nn.Linear(self.D, self.D),
         )
+        self.low_proj_for_scale0 = nn.Linear(self.low_channel, self.D)
         
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C)) #SOS pos embeding
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
@@ -384,6 +393,12 @@ class SRVAR(nn.Module):
             num_sampling_steps=str(diff_steps),
             grad_checkpointing=(self.checkpointing == 'full-block'),
         )
+        print(
+            f'[srvar config] scale0_query_source={self.scale0_query_source}, '
+            f'scale_loss_weighting={self.scale_loss_weighting}, '
+            f'diffloss_batch_mul={self.diffloss_batch_mul}',
+            flush=True,
+        )
     
     def compile_flex_attn(self):
         
@@ -472,6 +487,49 @@ class SRVAR(nn.Module):
             ref_f = ref_f.permute(0, 2, 3, 1).reshape(B, -1, ref_f.shape[1])
             low_f = torch.cat((low_f, ref_f), dim=1)
         return low_f
+
+    def _build_scale0_queries(
+        self,
+        sos: torch.Tensor,
+        low_f_BLC: torch.Tensor,
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> torch.Tensor:
+        """Build the initial query tokens for scale[0].
+
+        The legacy `sos` path keeps exact old behavior. `low_f_pool` injects a
+        spatially-pooled LR latent grid so the first 4x4 tokens do not all start
+        from the same global vector.
+        """
+        B = sos.shape[0]
+        pn_t, pn_h, pn_w = scale_schedule[0]
+        first_l = int(pn_t * pn_h * pn_w)
+        assert first_l == self.first_l, (
+            f'first scale token count {first_l} != model first_l={self.first_l}; '
+            f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
+        )
+
+        global_sos = sos.unsqueeze(1).expand(B, first_l, -1)
+        pos = self.pos_start.expand(B, first_l, -1)
+        if self.scale0_query_source == 'sos':
+            return global_sos + pos
+
+        assert pn_t == 1, f'low_f_pool scale0 query expects 2D scale[0], got {scale_schedule[0]}'
+        source_BLC = low_f_BLC
+        if self.use_ref and source_BLC.shape[1] % 2 == 0:
+            source_BLC = source_BLC[:, :source_BLC.shape[1] // 2]
+
+        low_len = source_BLC.shape[1]
+        low_side = math.isqrt(low_len)
+        if low_side * low_side != low_len:
+            raise ValueError(
+                f'scale0_query_source=low_f_pool requires a square LR token grid; '
+                f'got low_len={low_len}, full_low_len={low_f_BLC.shape[1]}, use_ref={self.use_ref}'
+            )
+
+        source_BChw = source_BLC.transpose(1, 2).reshape(B, source_BLC.shape[-1], low_side, low_side)
+        pooled = F.adaptive_avg_pool2d(source_BChw, output_size=(pn_h, pn_w))
+        pooled_BLC = pooled.flatten(2).transpose(1, 2).contiguous()
+        return global_sos + self.low_proj_for_scale0(pooled_BLC) + pos
     
     def get_scale_logits(self,
                    si,
@@ -549,6 +607,7 @@ class SRVAR(nn.Module):
 
         kv_compact = low_f.reshape(-1, low_f.shape[-1])
         kv_compact = self.low_norm(kv_compact)
+        low_f_BLC = kv_compact.reshape(B, lowLen, -1)
         sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k))
         kv_compact = self.low_proj_for_ca(kv_compact)
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
@@ -562,7 +621,7 @@ class SRVAR(nn.Module):
             f'first scale token count {first_l} != model first_l={self.first_l}; '
             f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
         )
-        last_stage = sos.unsqueeze(1).expand(B, first_l, -1) + self.pos_start.expand(B, first_l, -1)
+        last_stage = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
         accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
         num_stages_minus_1 = len(scale_schedule) - 1
         need_to_pad = 0
@@ -704,6 +763,7 @@ class SRVAR(nn.Module):
                     total += int(le.item())
             must_on_graph = self.cfg_uncond[0, 0] * 0           # keep cfg_uncond in graph
             kv_compact = self.low_norm(kv_compact).contiguous()
+            low_f_BLC = kv_compact.reshape(B, lowLen, -1)
             sos = cond_BD = self.low_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)).float().contiguous()
             kv_compact = self.low_proj_for_ca(kv_compact).contiguous()
             kv_compact[0, 0] += must_on_graph
@@ -730,7 +790,7 @@ class SRVAR(nn.Module):
                     f'ms_x_input=None but scale_schedule has {expected_ms_x_l} '
                     f'teacher-forcing tokens after scale[0].'
                 )
-            sos = sos.unsqueeze(1).expand(B, first_l, -1) + self.pos_start.expand(B, first_l, -1)
+            sos = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
             if ms_x_input is not None:
                 x_BLC = torch.cat(
                     (sos, self.word_embed(self.norm0_ve(ms_x_input))), dim=1
@@ -815,12 +875,19 @@ class SRVAR(nn.Module):
         z_flat = z_BLD.reshape(-1, z_BLD.shape[-1]).contiguous()
         tgt_flat = target_BLC.reshape(-1, target_BLC.shape[-1]).contiguous()
 
-        # Optional mask: drop scale[0] tokens (used in Plan-A `--skip_scale0_loss`).
+        # Optional mask/weight: Plan-A can drop scale[0], and equal_scale makes
+        # each scale contribute an equal average regardless of token count.
         loss_mask: Optional[torch.Tensor] = None
-        if scale0_loss_mask:
-            num_scale0 = int(scale_schedule[0][0] * scale_schedule[0][1] * scale_schedule[0][2])
+        if scale0_loss_mask or self.scale_loss_weighting == 'equal_scale':
             mask_BL = torch.ones(B, target_BLC.shape[1], device=device, dtype=torch.float32)
-            mask_BL[:, :num_scale0] = 0.0
+            ptr = 0
+            for si, pn in enumerate(scale_schedule):
+                n = int(pn[0] * pn[1] * pn[2])
+                if scale0_loss_mask and si == 0:
+                    mask_BL[:, ptr:ptr + n] = 0.0
+                elif self.scale_loss_weighting == 'equal_scale':
+                    mask_BL[:, ptr:ptr + n] = 1.0 / max(1, n)
+                ptr += n
             loss_mask = mask_BL.reshape(-1)
 
         # MAR-style diffloss_batch_mul: repeat the per-token pairs to reduce variance.
@@ -894,6 +961,29 @@ class SRVAR(nn.Module):
             elif hasattr(sab, 'ada_gss'):
                 sab.ada_gss.data[:, :, :2, :].mul_(aln_gamma_init)  # init gamma
                 sab.ada_gss.data[:, :, 2:, :].mul_(aln_init)        # init scale and shift
+        self._assert_diffloss_final_layer_zero()
+
+    def _assert_diffloss_final_layer_zero(self):
+        final_layer = self.diffloss.net.final_layer
+        linear = final_layer.linear
+        ada = final_layer.adaLN_modulation[-1]
+        with torch.no_grad():
+            linear_weight_norm = float(linear.weight.detach().norm().item())
+            linear_bias_norm = float(linear.bias.detach().norm().item()) if linear.bias is not None else 0.0
+            ada_weight_norm = float(ada.weight.detach().norm().item())
+            ada_bias_norm = float(ada.bias.detach().norm().item()) if ada.bias is not None else 0.0
+        print(
+            '[diffloss init] '
+            f'final_linear_w={linear_weight_norm:.6e} final_linear_b={linear_bias_norm:.6e} '
+            f'final_adaln_w={ada_weight_norm:.6e} final_adaln_b={ada_bias_norm:.6e}',
+            flush=True,
+        )
+        eps = 1e-8
+        assert linear_weight_norm <= eps and linear_bias_norm <= eps and ada_weight_norm <= eps and ada_bias_norm <= eps, (
+            'DiffLoss final layer lost its MAR zero initialization; '
+            f'linear_w={linear_weight_norm}, linear_b={linear_bias_norm}, '
+            f'ada_w={ada_weight_norm}, ada_b={ada_bias_norm}'
+        )
     
     def init_weights(self, conv_std_or_gain: float = 0.02, other_std: float = 0.02):
         """
@@ -907,7 +997,10 @@ class SRVAR(nn.Module):
         skip = abs(conv_std_or_gain) > 10
         if skip: return
         print(f'[init_weights] {type(self).__name__} with {"std" if conv_std_or_gain > 0 else "gain"}={abs(conv_std_or_gain):g}')
+        diffloss_modules = set(self.diffloss.modules()) if hasattr(self, 'diffloss') else set()
         for m in self.modules():
+            if m in diffloss_modules:
+                continue
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight.data, std=other_std)
                 if m.bias is not None:

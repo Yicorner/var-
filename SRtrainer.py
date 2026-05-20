@@ -506,6 +506,8 @@ class SRVARTrainer(object):
             'lr_cond_source': self.lr_cond_source,
             'skip_scale0_loss': self.skip_scale0_loss,
             'diffloss_batch_mul': self.diffloss_batch_mul,
+            'scale0_query_source': getattr(self.srvar_wo_ddp, 'scale0_query_source', 'sos'),
+            'scale_loss_weighting': getattr(self.srvar_wo_ddp, 'scale_loss_weighting', 'token'),
         }
 
     def state_dict(self):
@@ -544,6 +546,8 @@ class SRVARTrainer(object):
             self.last_prog_si = config.get('last_prog_si', -1)
             self.first_prog = config.get('first_prog', True)
             for k, v in self.get_config().items():
+                if k not in config:
+                    continue
                 if config.get(k, None) != v:
                     err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
                     if strict:
