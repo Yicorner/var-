@@ -69,8 +69,13 @@ RECON_MAX_SAMPLES=${RECON_MAX_SAMPLES:-${reconstruction_max_samples:-4}}
 RECON_DIR_NAME=${RECON_DIR_NAME:-${reconstruction_dir_name:-reconstruction_samples}}
 EVAL_AR_MAX_BATCHES=${EVAL_AR_MAX_BATCHES:-${eval_ar_max_batches:-4}}
 
-# -------- logging --------
-TRAIN_LOG_POINTS_PER_EPOCH=${TRAIN_LOG_POINTS_PER_EPOCH:-${train_log_points_per_epoch:-8}}
+# -------- logging / diagnostics --------
+TRAIN_LOG_POINTS_PER_EPOCH=${TRAIN_LOG_POINTS_PER_EPOCH:-${train_log_points_per_epoch:-32}}
+DIAGNOSTICS_ENABLED=${DIAGNOSTICS_ENABLED:-${diagnostics_enabled:-True}}
+DIAGNOSTICS_INTERVAL=${DIAGNOSTICS_INTERVAL:-${diagnostics_interval:-0}}
+DIAGNOSTICS_DIR_NAME=${DIAGNOSTICS_DIR_NAME:-${diagnostics_dir_name:-diagnostics}}
+DIAGNOSTICS_MAX_SAMPLES=${DIAGNOSTICS_MAX_SAMPLES:-${diagnostics_max_samples:-4}}
+DIAGNOSTICS_SAMPLE_SCALE0=${DIAGNOSTICS_SAMPLE_SCALE0:-${diagnostics_sample_scale0:-True}}
 
 # Compose stage1 path additions only when STAGE1_CKPT is non-empty.
 STAGE1_ARGS=()
@@ -112,6 +117,11 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --reconstruction_dir_name="$RECON_DIR_NAME" \
   --eval_ar_max_batches="$EVAL_AR_MAX_BATCHES" \
   --train_log_points_per_epoch="$TRAIN_LOG_POINTS_PER_EPOCH" \
+  --diagnostics_enabled="$DIAGNOSTICS_ENABLED" \
+  --diagnostics_interval="$DIAGNOSTICS_INTERVAL" \
+  --diagnostics_dir_name="$DIAGNOSTICS_DIR_NAME" \
+  --diagnostics_max_samples="$DIAGNOSTICS_MAX_SAMPLES" \
+  --diagnostics_sample_scale0="$DIAGNOSTICS_SAMPLE_SCALE0" \
   --use_ref=False \
   "${STAGE1_ARGS[@]}"
 

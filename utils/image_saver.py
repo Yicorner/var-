@@ -81,6 +81,60 @@ def save_reconstruction_comparison(
     return filepath
 
 
+def save_diagnostic_comparison(
+    lr: torch.Tensor,
+    hr_ar: torch.Tensor,
+    hr_scale0: Optional[torch.Tensor],
+    hr_oracle: torch.Tensor,
+    hr_gt: torch.Tensor,
+    save_dir: str,
+    ep: int,
+    it: int,
+    max_samples: int = 4,
+) -> str:
+    """Save diagnostic rows: `LR | AR/full | AR/scale0-only | VAE_oracle | HR_gt`.
+
+    `hr_oracle` is decoded from the frozen VAE target latents, so it is the upper
+    bound for this VAE checkpoint. `hr_scale0` decodes the image after sampling
+    only the first AR scale; it can be `None` when disabled.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    lr_denorm = denormalize_image(lr.clone())
+    ar_denorm = denormalize_image(hr_ar.clone())
+    oracle_denorm = denormalize_image(hr_oracle.clone())
+    gt_denorm = denormalize_image(hr_gt.clone())
+    scale0_denorm = denormalize_image(hr_scale0.clone()) if hr_scale0 is not None else None
+
+    target_hw = gt_denorm.shape[-2:]
+    lr_up = _resize_to(lr_denorm, target_hw)
+    if scale0_denorm is None:
+        scale0_denorm = torch.zeros_like(gt_denorm)
+    else:
+        scale0_denorm = _resize_to(scale0_denorm, target_hw)
+
+    num_samples = min(gt_denorm.shape[0], max_samples)
+    tiles: List[torch.Tensor] = []
+    for i in range(num_samples):
+        tiles.extend([
+            lr_up[i],
+            ar_denorm[i],
+            scale0_denorm[i],
+            oracle_denorm[i],
+            gt_denorm[i],
+        ])
+
+    grid = torchvision.utils.make_grid(
+        torch.stack(tiles, dim=0),
+        nrow=5,
+        padding=2,
+        pad_value=1.0,
+    )
+    filepath = os.path.join(save_dir, f"ep{ep:04d}_it{it:06d}_diagnostic.png")
+    tensor_to_pil_image(grid).save(filepath)
+    return filepath
+
+
 def save_reconstruction_run_metadata(
     save_dir: str,
     args_state: Dict[str, Any],
@@ -97,6 +151,7 @@ def save_reconstruction_run_metadata(
         "filename_pattern": filename_pattern,
         "frequency_description": frequency_description,
         "comparison_layout": "3 columns per row: LR_upsampled | HR_pred | HR_gt",
+        "diagnostic_layout": "5 columns per row when enabled: LR_upsampled | AR_full | AR_scale0_only | VAE_oracle | HR_gt",
         "max_samples_per_image": int(max_samples),
         "postprocess": [
             "denormalize LR/HR_pred/HR_gt from [-1, 1] to [0, 1]",

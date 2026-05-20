@@ -59,8 +59,14 @@ class Args(Tap):
     reconstruction_dir_name: str = 'reconstruction_samples'
     record_reconstruction_metadata: bool = True
     eval_ar_max_batches: int = 4
-    train_log_points_per_epoch: int = 8
+    train_log_points_per_epoch: int = 32
     log_train_psnr: bool = False
+    # Diagnostic outputs for early continuous-AR debugging.
+    diagnostics_enabled: bool = True
+    diagnostics_interval: int = 0          # 0: follow train log iters; >0: every N iters
+    diagnostics_dir_name: str = 'diagnostics'
+    diagnostics_max_samples: int = 4
+    diagnostics_sample_scale0: bool = True
     # VAR
     # depth: int = 16     # VAR depth
     # ini: float = -1     # -1: automated model parameter initialization

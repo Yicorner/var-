@@ -355,7 +355,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
-    log_points = max(1, int(getattr(args, 'train_log_points_per_epoch', 8)))
+    log_points = max(1, int(getattr(args, 'train_log_points_per_epoch', 32)))
     for it, datas in me.log_every(start_it, iters_train, ld_or_itrt, log_points, header):
         if args.use_ref:
             low, super, ref = datas

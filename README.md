@@ -139,6 +139,23 @@ PSNR / SSIM 与 myvaex 完全一致：RGB 通道、[0,1]、`skimage.metrics`，`
 - `args`：本次训练参数的完整快照
 - `postprocess`：denormalize / clamp / upsample / grid 的完整后处理链
 
+### 6.1 诊断图与更高频日志
+
+默认 `TRAIN_LOG_POINTS_PER_EPOCH=32`，会比之前更频繁地打印训练日志。诊断输出默认开启：
+
+```bash
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_INTERVAL=0 \
+DIAGNOSTICS_DIR_NAME=diagnostics \
+bash SRtrain.sh
+```
+
+- `DIAGNOSTICS_INTERVAL=0`：跟随 train log iter；设成 `500` 表示每 500 iter 额外诊断一次。
+- 诊断图是 **5 列**：`LR_upsampled | AR_full | AR_scale0_only | VAE_oracle | HR_gt`。
+- `VAE_oracle` 是用 HR 经冻结 VAE 得到的 target latent 直接 decode，代表这份 VAE ckpt 的重建上限。
+- `AR_scale0_only` 是只跑第 0 个 AR scale 的 diffusion sampling，把这个 coarse latent 上采样/累积后直接 decode，用来判断 scale[0] 起步是否已经坏掉。
+- stdout 会打印 `[diagnostics ...]` 和 `[diagnostics latent]`，包含 AR / scale0 / oracle 的 PSNR、SSIM 和 target/sample latent 的 mean/std/min/max。
+
 ---
 
 ## 7. 与 myvaex stage1/stage2 ckpt 的兼容性
@@ -162,5 +179,23 @@ PATCH_NUMS_STR="4 5 6 8 10 13 16" \
 RECON_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE \
 VAL_AND_SAVING_PER_EP=1 \
 VAE_CH=160 \
+bash SRtrain.sh
+```
+
+```bash
+EXP_NAME=srvar_lr256_baseline_Diagnostics \
+EXP_NOTE="cond and scale[0] don't depend on LR_VAE with diagnostics" \
+LR_FOLDER=LR \
+SAME_SHAPE=False \
+DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
+VAE_CKPT=/home/featurize/work/myvaex/local_output/test/test_stage2_with_alignment_epoch3/ckpt-2.pth \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+RECON_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE_with_diagnostics \
+VAL_AND_SAVING_PER_EP=1 \
+VAE_CH=160 \
+TRAIN_LOG_POINTS_PER_EPOCH=64 \
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_INTERVAL=500 \
+DIAGNOSTICS_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE_with_diagnostics/diagnostics \
 bash SRtrain.sh
 ```

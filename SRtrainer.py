@@ -113,6 +113,25 @@ class SRVARTrainer(object):
             ms_h_target, ms_x_input, f_hat_full = self.vae_local.img_to_ms_continuous_input(inp_B3HW_super)
         return ms_h_target, ms_x_input, f_hat_full
 
+    @staticmethod
+    def _tensor_stats(name: str, tensor: Optional[Ten]) -> str:
+        if tensor is None:
+            return f'{name}=None'
+        t = tensor.detach().float()
+        return (
+            f'{name}: shape={tuple(t.shape)} '
+            f'mean={t.mean().item():+.4f} std={t.std(unbiased=False).item():.4f} '
+            f'min={t.min().item():+.4f} max={t.max().item():+.4f}'
+        )
+
+    @staticmethod
+    def _should_run_event(it: int, metric_lg: MetricLogger, interval: int) -> bool:
+        return (
+            it == 0
+            or it in metric_lg.log_iters
+            or (interval > 0 and it % interval == 0)
+        )
+
     def _maybe_lr_vae_override(
         self,
         inp_B3HW_low: Ten,
@@ -218,6 +237,39 @@ class SRVARTrainer(object):
         return diff_loss, psnr_mean, ssim_mean, tot, time.time() - stt
 
     @torch.no_grad()
+    def _sample_ar(
+        self,
+        inp_B3HW_low: Ten,
+        scale_schedule: List[Tuple[int, int, int]],
+        ref_B3HW: Optional[Ten],
+        low_f_override: Optional[Ten],
+        cfg: float = 1.0,
+        temperature: float = 1.0,
+        trunk_scale: int = 1000,
+    ) -> Tuple[Ten, List[Ten], Ten]:
+        """Run AR sampling and return `(rec_img, sampled_tokens, f_hat)`."""
+        was_training = self.srvar_wo_ddp.training
+        self.srvar_wo_ddp.eval()
+        try:
+            sampled_tokens, fhat_tup, _ = self.srvar_wo_ddp.autoregressive_infer_cfg(
+                vae=self.vae_local,
+                scale_schedule=scale_schedule,
+                inp_B3HW_low=inp_B3HW_low,
+                ref_B3HW=ref_B3HW,
+                low_f_override=low_f_override,
+                B=inp_B3HW_low.shape[0],
+                return_fhat=True,
+                cfg=cfg,
+                temperature=temperature,
+                trunk_scale=trunk_scale,
+            )
+            f_hat = fhat_tup[0]
+            rec = self.vae_local.fhat_to_img(f_hat)
+        finally:
+            self.srvar_wo_ddp.train(was_training)
+        return rec, sampled_tokens, f_hat
+
+    @torch.no_grad()
     def _quick_reconstruction(
         self,
         inp_B3HW_low: Ten,
@@ -228,24 +280,10 @@ class SRVARTrainer(object):
         temperature: float = 1.0,
     ) -> Ten:
         """Run AR sampling and return reconstructed HR `[B, 3, H, W]` in [-1, 1]."""
-        was_training = self.srvar_wo_ddp.training
-        self.srvar_wo_ddp.eval()
-        try:
-            _, fhat_tup, _ = self.srvar_wo_ddp.autoregressive_infer_cfg(
-                vae=self.vae_local,
-                scale_schedule=scale_schedule,
-                inp_B3HW_low=inp_B3HW_low,
-                ref_B3HW=ref_B3HW,
-                low_f_override=low_f_override,
-                B=inp_B3HW_low.shape[0],
-                return_fhat=True,
-                cfg=cfg,
-                temperature=temperature,
-            )
-            f_hat = fhat_tup[0]
-            rec = self.vae_local.fhat_to_img(f_hat)
-        finally:
-            self.srvar_wo_ddp.train(was_training)
+        rec, _, _ = self._sample_ar(
+            inp_B3HW_low, scale_schedule, ref_B3HW, low_f_override,
+            cfg=cfg, temperature=temperature,
+        )
         return rec
 
     # ----------------------------------------------------------------- train
@@ -282,7 +320,7 @@ class SRVARTrainer(object):
         self.srvar.require_backward_grad_sync = stepping
 
         B = inp_B3HW_low.shape[0]
-        ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
+        ms_h_target, ms_x_input, f_hat_full = self._build_targets(inp_B3HW_super)
         ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
         scale_schedule = self._get_scale_schedule(inp_B3HW_low)
 
@@ -302,8 +340,18 @@ class SRVARTrainer(object):
             ep=ep, it=it, g_it=g_it, stepping=stepping, loss=loss, clip_decay_ratio=clip_decay_ratio,
         )
 
+        recon_interval = int(getattr(self.args, 'reconstruction_save_interval', 0) or 0) if self.args is not None else 0
+        diag_interval = int(getattr(self.args, 'diagnostics_interval', 0) or 0) if self.args is not None else 0
+        log_event = self._should_run_event(it, metric_lg, interval=0)
+        recon_event = self._should_run_event(it, metric_lg, interval=recon_interval)
+        diag_event = (
+            self.args is not None
+            and getattr(self.args, 'diagnostics_enabled', True)
+            and self._should_run_event(it, metric_lg, interval=diag_interval)
+        )
+
         # Light-weight metric logging on the configured log iterations.
-        if it == 0 or it in metric_lg.log_iters:
+        if log_event:
             grad_norm_val = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
             metric_lg.update(
                 Ld=float(loss.item()),
@@ -312,15 +360,18 @@ class SRVARTrainer(object):
             )
 
             # Reconstruction visualization + auxiliary PSNR (cheap-ish).
-            if self.args is not None and getattr(self.args, 'save_reconstruction_images', True):
+        if self.args is not None and (recon_event or diag_event):
+            if getattr(self.args, 'save_reconstruction_images', True) or diag_event:
                 try:
                     self._maybe_save_reconstruction(
                         ep, it, inp_B3HW_low, inp_B3HW_super, ref_B3HW,
-                        low_f_override, scale_schedule,
+                        low_f_override, scale_schedule, f_hat_full, ms_h_target,
+                        save_reconstruction=bool(getattr(self.args, 'save_reconstruction_images', True) and recon_event),
+                        save_diagnostics=bool(diag_event),
                     )
                 except Exception as e:
                     if dist.is_master():
-                        print(f'[train_step] reconstruction save skipped: {e}')
+                        print(f'[train_step] reconstruction/diagnostics skipped: {e}')
 
         if g_it == 0 or (g_it + 1) % 500 == 0:
             if dist.is_master():
@@ -344,12 +395,18 @@ class SRVARTrainer(object):
         ref_B3HW: Optional[Ten],
         low_f_override: Optional[Ten],
         scale_schedule: List[Tuple[int, int, int]],
+        f_hat_full: Ten,
+        ms_h_target: List[Ten],
+        save_reconstruction: bool = True,
+        save_diagnostics: bool = False,
     ):
-        """Render a 3-column LR_upsampled | HR_pred | HR_gt grid every log iter."""
+        """Render reconstruction and diagnostic grids on selected iterations."""
         if not dist.is_master():
             return
         from utils.image_saver import save_reconstruction_comparison
         from utils.image_saver import save_reconstruction_run_metadata
+        from utils.image_saver import save_diagnostic_comparison
+        from utils.image_saver import compute_psnr_ssim
 
         args = self.args
         save_dir = os.path.join(
@@ -360,21 +417,70 @@ class SRVARTrainer(object):
         max_samples = int(getattr(args, 'reconstruction_max_samples', 4))
         max_B = min(inp_B3HW_low.shape[0], max_samples)
         with torch.no_grad():
-            rec = self._quick_reconstruction(
+            rec, sampled_tokens, _ = self._sample_ar(
                 inp_B3HW_low[:max_B], scale_schedule,
                 ref_B3HW[:max_B] if ref_B3HW is not None else None,
                 low_f_override[:max_B] if low_f_override is not None else None,
             )
+            oracle = self.vae_local.fhat_to_img(f_hat_full[:max_B])
 
-        save_reconstruction_comparison(
-            lr=inp_B3HW_low[:max_B],
-            hr_pred=rec,
-            hr_gt=inp_B3HW_super[:max_B],
-            save_dir=save_dir,
-            ep=ep,
-            it=it,
-            max_samples=max_samples,
-        )
+        if save_reconstruction:
+            save_reconstruction_comparison(
+                lr=inp_B3HW_low[:max_B],
+                hr_pred=rec,
+                hr_gt=inp_B3HW_super[:max_B],
+                save_dir=save_dir,
+                ep=ep,
+                it=it,
+                max_samples=max_samples,
+            )
+
+        if save_diagnostics:
+            diag_dir = os.path.join(
+                getattr(args, 'local_out_dir_path', './local_output'),
+                getattr(args, 'diagnostics_dir_name', 'diagnostics'),
+            )
+            rec_scale0 = None
+            scale0_tokens = []
+            if getattr(args, 'diagnostics_sample_scale0', True):
+                rec_scale0, scale0_tokens, _ = self._sample_ar(
+                    inp_B3HW_low[:max_B], scale_schedule,
+                    ref_B3HW[:max_B] if ref_B3HW is not None else None,
+                    low_f_override[:max_B] if low_f_override is not None else None,
+                    trunk_scale=1,
+                )
+            save_diagnostic_comparison(
+                lr=inp_B3HW_low[:max_B],
+                hr_ar=rec,
+                hr_scale0=rec_scale0,
+                hr_oracle=oracle,
+                hr_gt=inp_B3HW_super[:max_B],
+                save_dir=diag_dir,
+                ep=ep,
+                it=it,
+                max_samples=int(getattr(args, 'diagnostics_max_samples', max_samples)),
+            )
+
+            ar_metrics = compute_psnr_ssim(rec, inp_B3HW_super[:max_B])
+            oracle_metrics = compute_psnr_ssim(oracle, inp_B3HW_super[:max_B])
+            scale0_metrics = compute_psnr_ssim(rec_scale0, inp_B3HW_super[:max_B]) if rec_scale0 is not None else None
+            print(
+                f'[diagnostics ep={ep} it={it}] '
+                f'AR_PSNR={ar_metrics["psnr_mean"]:.2f} AR_SSIM={ar_metrics["ssim_mean"]:.4f} | '
+                f'ORACLE_PSNR={oracle_metrics["psnr_mean"]:.2f} ORACLE_SSIM={oracle_metrics["ssim_mean"]:.4f}'
+                + (
+                    f' | SCALE0_PSNR={scale0_metrics["psnr_mean"]:.2f} SCALE0_SSIM={scale0_metrics["ssim_mean"]:.4f}'
+                    if scale0_metrics is not None else ''
+                )
+            )
+            print('[diagnostics latent] ' + ' | '.join([
+                self._tensor_stats('lr', inp_B3HW_low[:max_B]),
+                self._tensor_stats('target_s0', ms_h_target[0][:max_B]),
+                self._tensor_stats('target_last', ms_h_target[-1][:max_B]),
+                self._tensor_stats('sample_s0', sampled_tokens[0] if sampled_tokens else None),
+                self._tensor_stats('sample_last', sampled_tokens[-1] if sampled_tokens else None),
+                self._tensor_stats('sample_s0_only', scale0_tokens[0] if scale0_tokens else None),
+            ]))
 
         if not self._reconstruction_metadata_written and getattr(args, 'record_reconstruction_metadata', True):
             save_reconstruction_run_metadata(
