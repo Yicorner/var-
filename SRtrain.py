@@ -347,6 +347,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     me = misc.MetricLogger(delimiter='  ')
     me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
     me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    me.add_meter('opt_step', misc.SmoothedValue(window_size=1, fmt='{value:.0f}'))
     me.add_meter('Ld', misc.SmoothedValue(fmt='{median:.4f} ({global_avg:.4f})'))
     header = f'[Ep]: [{ep:4d}/{args.ep}]'
     
@@ -397,7 +398,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             inp_B3HW_low=low, inp_B3HW_super=super, ref_B3HW = ref , prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
         
-        me.update(tlr=max_tlr)
+        me.update(tlr=max_tlr, opt_step=(g_it + 1) // args.ac)
         tb_lg.set_step(step=g_it)
         tb_lg.update(head='AR_opt_lr/lr_min', sche_tlr=min_tlr)
         tb_lg.update(head='AR_opt_lr/lr_max', sche_tlr=max_tlr)

@@ -31,9 +31,11 @@ class DiffLoss(nn.Module):
         width: int,
         num_sampling_steps: str = "100",
         grad_checkpointing: bool = False,
+        sample_clip_denoised: bool = False,
     ):
         super().__init__()
         self.in_channels = target_channels
+        self.sample_clip_denoised = bool(sample_clip_denoised)
         self.net = SimpleMLPAdaLN(
             in_channels=target_channels,
             model_channels=width,
@@ -91,7 +93,7 @@ class DiffLoss(nn.Module):
             sample_fn,
             noise.shape,
             noise,
-            clip_denoised=False,
+            clip_denoised=self.sample_clip_denoised,
             model_kwargs=model_kwargs,
             progress=False,
             temperature=temperature,

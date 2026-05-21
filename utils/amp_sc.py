@@ -168,7 +168,8 @@ class AmpOptimizer:
             if self.late_clipping:
                 orig_norm: Optional[torch.Tensor] = self.optimizer.global_grad_norm
             self.last_orig_norm = orig_norm
-            # no zero_grad calling here, gonna log those gradients!
+
+            self.optimizer.zero_grad(set_to_none=True)
         return orig_norm, scaler_sc
     
     def state_dict(self):

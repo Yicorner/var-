@@ -51,6 +51,7 @@ class Args(Tap):
     diffloss_d: int = 3
     diff_steps: str = '100'             # inference sampling steps (spaced IDDPM)
     diffloss_batch_mul: int = 4         # per-token MAR-style batch multiplier
+    diffloss_sample_clip_denoised: bool = False  # clamp predicted x0 during DiffLoss sampling
     scale_loss_weighting: str = 'token' # 'token' or 'equal_scale'
     scale0_query_source: str = 'sos'    # 'sos' or 'low_f_pool'
     cfg_infer: float = 1.0              # inference CFG scale (>1 sharpens condition)

@@ -115,6 +115,7 @@ class SRVAR(nn.Module):
         diffloss_d: int = 3,
         diff_steps: str = "100",
         diffloss_batch_mul: int = 4,
+        diffloss_sample_clip_denoised: bool = False,
         scale_loss_weighting: str = 'token',
         scale0_query_source: str = 'sos',
         # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
@@ -392,11 +393,13 @@ class SRVAR(nn.Module):
             width=int(diffloss_w),
             num_sampling_steps=str(diff_steps),
             grad_checkpointing=(self.checkpointing == 'full-block'),
+            sample_clip_denoised=bool(diffloss_sample_clip_denoised),
         )
         print(
             f'[srvar config] scale0_query_source={self.scale0_query_source}, '
             f'scale_loss_weighting={self.scale_loss_weighting}, '
-            f'diffloss_batch_mul={self.diffloss_batch_mul}',
+            f'diffloss_batch_mul={self.diffloss_batch_mul}, '
+            f'diffloss_sample_clip_denoised={bool(diffloss_sample_clip_denoised)}',
             flush=True,
         )
     
