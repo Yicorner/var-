@@ -352,12 +352,12 @@ class SRVARTrainer(object):
 
         # Light-weight metric logging on the configured log iterations.
         if log_event:
-            grad_norm_val = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
-            metric_lg.update(
-                Ld=float(loss.item()),
-                tnm=grad_norm_val,
-                step=g_it,
-            )
+            metric_kwargs = dict(Ld=float(loss.item()), step=g_it)
+            if grad_norm is not None:
+                metric_kwargs['tnm'] = (
+                    grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+                )
+            metric_lg.update(**metric_kwargs)
 
             # Reconstruction visualization + auxiliary PSNR (cheap-ish).
         if self.args is not None and (recon_event or diag_event):

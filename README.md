@@ -207,6 +207,7 @@ SCALE_LOSS_WEIGHTING=equal_scale \
 TRAIN_LOG_POINTS_PER_EPOCH=64 \
 DIAGNOSTICS_ENABLED=True \
 DIAGNOSTICS_INTERVAL=500 \
+DIAGNOSTICS_DIR_NAME=scale0_lrq_equal_loss/diagnostics \
 bash SRtrain.sh
 ```
 
@@ -225,5 +226,29 @@ TRAIN_LOG_POINTS_PER_EPOCH=64 \
 DIAGNOSTICS_ENABLED=True \
 DIAGNOSTICS_INTERVAL=500 \
 DIAGNOSTICS_DIR_NAME=cond_and_scale[0]_dont_depend_on_LR_VAE_with_diagnostics/diagnostics \
+bash SRtrain.sh
+```
+
+```bash
+EXP_NAME=srvar_scale0_lrq_equal_loss_fix_grad_bug \
+EXP_NOTE="LR-conditioned scale0 query + equal-scale DiffLoss + fix zero grad bug + clipped DiffLoss sampling diagnostic" \
+LR_FOLDER=LR \
+SAME_SHAPE=False \
+DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
+VAE_CKPT=/home/featurize/work/myvaex/local_output/test/test_stage2_with_alignment_epoch3/ckpt-2.pth \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+RECON_DIR_NAME=srvar_scale0_lrq_equal_loss_fix_grad_bug \
+VAL_AND_SAVING_PER_EP=1 \
+VAE_CH=160 \
+BS=64 \
+AC=16 \
+LR=4e-4 \
+WP=0.05 \
+SCALE0_QUERY_SOURCE=low_f_pool \
+SCALE_LOSS_WEIGHTING=equal_scale \
+TRAIN_LOG_POINTS_PER_EPOCH=64 \
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_INTERVAL=500 \
+DIAGNOSTICS_DIR_NAME=srvar_scale0_lrq_equal_loss_fix_grad_bug/diagnostics \
 bash SRtrain.sh
 ```
