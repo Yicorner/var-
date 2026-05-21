@@ -85,6 +85,7 @@ def save_diagnostic_comparison(
     lr: torch.Tensor,
     hr_ar: torch.Tensor,
     hr_scale0: Optional[torch.Tensor],
+    hr_scale0_oracle: Optional[torch.Tensor],
     hr_oracle: torch.Tensor,
     hr_gt: torch.Tensor,
     save_dir: str,
@@ -92,11 +93,12 @@ def save_diagnostic_comparison(
     it: int,
     max_samples: int = 4,
 ) -> str:
-    """Save diagnostic rows: `LR | AR/full | AR/scale0-only | VAE_oracle | HR_gt`.
+    """Save diagnostic rows.
 
     `hr_oracle` is decoded from the frozen VAE target latents, so it is the upper
     bound for this VAE checkpoint. `hr_scale0` decodes the image after sampling
-    only the first AR scale; it can be `None` when disabled.
+    only the first AR scale; `hr_scale0_oracle` decodes the true first-scale
+    target only. Either scale0 image can be `None` when disabled.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -105,6 +107,7 @@ def save_diagnostic_comparison(
     oracle_denorm = denormalize_image(hr_oracle.clone())
     gt_denorm = denormalize_image(hr_gt.clone())
     scale0_denorm = denormalize_image(hr_scale0.clone()) if hr_scale0 is not None else None
+    scale0_oracle_denorm = denormalize_image(hr_scale0_oracle.clone()) if hr_scale0_oracle is not None else None
 
     target_hw = gt_denorm.shape[-2:]
     lr_up = _resize_to(lr_denorm, target_hw)
@@ -112,21 +115,29 @@ def save_diagnostic_comparison(
         scale0_denorm = torch.zeros_like(gt_denorm)
     else:
         scale0_denorm = _resize_to(scale0_denorm, target_hw)
+    if scale0_oracle_denorm is not None:
+        scale0_oracle_denorm = _resize_to(scale0_oracle_denorm, target_hw)
 
     num_samples = min(gt_denorm.shape[0], max_samples)
+    has_scale0_oracle = scale0_oracle_denorm is not None
     tiles: List[torch.Tensor] = []
     for i in range(num_samples):
-        tiles.extend([
+        row = [
             lr_up[i],
             ar_denorm[i],
             scale0_denorm[i],
+        ]
+        if has_scale0_oracle:
+            row.append(scale0_oracle_denorm[i])
+        row.extend([
             oracle_denorm[i],
             gt_denorm[i],
         ])
+        tiles.extend(row)
 
     grid = torchvision.utils.make_grid(
         torch.stack(tiles, dim=0),
-        nrow=5,
+        nrow=6 if has_scale0_oracle else 5,
         padding=2,
         pad_value=1.0,
     )
@@ -151,7 +162,7 @@ def save_reconstruction_run_metadata(
         "filename_pattern": filename_pattern,
         "frequency_description": frequency_description,
         "comparison_layout": "3 columns per row: LR_upsampled | HR_pred | HR_gt",
-        "diagnostic_layout": "5 columns per row when enabled: LR_upsampled | AR_full | AR_scale0_only | VAE_oracle | HR_gt",
+        "diagnostic_layout": "6 columns per row when enabled: LR_upsampled | AR_full | AR_scale0_only | target_scale0_only | VAE_oracle | HR_gt",
         "max_samples_per_image": int(max_samples),
         "postprocess": [
             "denormalize LR/HR_pred/HR_gt from [-1, 1] to [0, 1]",

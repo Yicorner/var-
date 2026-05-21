@@ -59,7 +59,8 @@ DIFFLOSS_W=${DIFFLOSS_W:-${diffloss_w:-1024}}
 DIFFLOSS_D=${DIFFLOSS_D:-${diffloss_d:-3}}
 DIFF_STEPS=${DIFF_STEPS:-${diff_steps:-100}}
 DIFFLOSS_BATCH_MUL=${DIFFLOSS_BATCH_MUL:-${diffloss_batch_mul:-4}}
-DIFFLOSS_SAMPLE_CLIP_DENOISED=${DIFFLOSS_SAMPLE_CLIP_DENOISED:-${diffloss_sample_clip_denoised:-False}}
+DIFFLOSS_SAMPLE_CLIP_DENOISED=${DIFFLOSS_SAMPLE_CLIP_DENOISED:-${diffloss_sample_clip_denoised:-True}}
+CONTINUOUS_HEAD_TYPE=${CONTINUOUS_HEAD_TYPE:-${continuous_head_type:-diffloss}}
 SCALE_LOSS_WEIGHTING=${SCALE_LOSS_WEIGHTING:-${scale_loss_weighting:-token}}
 SCALE0_QUERY_SOURCE=${SCALE0_QUERY_SOURCE:-${scale0_query_source:-sos}}
 
@@ -117,6 +118,7 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --diffloss_w="$DIFFLOSS_W" --diffloss_d="$DIFFLOSS_D" \
   --diff_steps="$DIFF_STEPS" --diffloss_batch_mul="$DIFFLOSS_BATCH_MUL" \
   --diffloss_sample_clip_denoised="$DIFFLOSS_SAMPLE_CLIP_DENOISED" \
+  --continuous_head_type="$CONTINUOUS_HEAD_TYPE" \
   --scale_loss_weighting="$SCALE_LOSS_WEIGHTING" \
   --scale0_query_source="$SCALE0_QUERY_SOURCE" \
   --save_reconstruction_images=True \

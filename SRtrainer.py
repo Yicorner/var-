@@ -270,6 +270,17 @@ class SRVARTrainer(object):
         return rec, sampled_tokens, f_hat
 
     @torch.no_grad()
+    def _decode_target_scale0_only(self, target_s0: Ten) -> Ten:
+        """Decode the true first-scale VAE target alone for diagnostic ceiling."""
+        B, C, _, _ = target_s0.shape
+        final_pn = int(self.patch_nums[-1])
+        accu = target_s0.new_zeros(B, C, final_pn, final_pn)
+        accu, _ = self.vae_local.quantize.get_next_autoregressive_input(
+            0, len(self.patch_nums), accu, target_s0,
+        )
+        return self.vae_local.fhat_to_img(accu)
+
+    @torch.no_grad()
     def _quick_reconstruction(
         self,
         inp_B3HW_low: Ten,
@@ -441,6 +452,7 @@ class SRVARTrainer(object):
                 getattr(args, 'diagnostics_dir_name', 'diagnostics'),
             )
             rec_scale0 = None
+            target_scale0_oracle = None
             scale0_tokens = []
             if getattr(args, 'diagnostics_sample_scale0', True):
                 rec_scale0, scale0_tokens, _ = self._sample_ar(
@@ -449,10 +461,12 @@ class SRVARTrainer(object):
                     low_f_override[:max_B] if low_f_override is not None else None,
                     trunk_scale=1,
                 )
+                target_scale0_oracle = self._decode_target_scale0_only(ms_h_target[0][:max_B])
             save_diagnostic_comparison(
                 lr=inp_B3HW_low[:max_B],
                 hr_ar=rec,
                 hr_scale0=rec_scale0,
+                hr_scale0_oracle=target_scale0_oracle,
                 hr_oracle=oracle,
                 hr_gt=inp_B3HW_super[:max_B],
                 save_dir=diag_dir,
@@ -464,6 +478,7 @@ class SRVARTrainer(object):
             ar_metrics = compute_psnr_ssim(rec, inp_B3HW_super[:max_B])
             oracle_metrics = compute_psnr_ssim(oracle, inp_B3HW_super[:max_B])
             scale0_metrics = compute_psnr_ssim(rec_scale0, inp_B3HW_super[:max_B]) if rec_scale0 is not None else None
+            target_scale0_metrics = compute_psnr_ssim(target_scale0_oracle, inp_B3HW_super[:max_B]) if target_scale0_oracle is not None else None
             print(
                 f'[diagnostics ep={ep} it={it}] '
                 f'AR_PSNR={ar_metrics["psnr_mean"]:.2f} AR_SSIM={ar_metrics["ssim_mean"]:.4f} | '
@@ -471,6 +486,10 @@ class SRVARTrainer(object):
                 + (
                     f' | SCALE0_PSNR={scale0_metrics["psnr_mean"]:.2f} SCALE0_SSIM={scale0_metrics["ssim_mean"]:.4f}'
                     if scale0_metrics is not None else ''
+                )
+                + (
+                    f' | TARGET_SCALE0_PSNR={target_scale0_metrics["psnr_mean"]:.2f} TARGET_SCALE0_SSIM={target_scale0_metrics["ssim_mean"]:.4f}'
+                    if target_scale0_metrics is not None else ''
                 )
             )
             print('[diagnostics latent] ' + ' | '.join([

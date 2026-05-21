@@ -31,7 +31,7 @@ class DiffLoss(nn.Module):
         width: int,
         num_sampling_steps: str = "100",
         grad_checkpointing: bool = False,
-        sample_clip_denoised: bool = False,
+        sample_clip_denoised: bool = True,
     ):
         super().__init__()
         self.in_channels = target_channels

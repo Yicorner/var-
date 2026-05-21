@@ -58,7 +58,8 @@ def build_vae_srvar(
         diffloss_d=getattr(args, 'diffloss_d', 3),
         diff_steps=str(getattr(args, 'diff_steps', '100')),
         diffloss_batch_mul=getattr(args, 'diffloss_batch_mul', 4),
-        diffloss_sample_clip_denoised=getattr(args, 'diffloss_sample_clip_denoised', False),
+        diffloss_sample_clip_denoised=getattr(args, 'diffloss_sample_clip_denoised', True),
+        continuous_head_type=getattr(args, 'continuous_head_type', 'diffloss'),
         scale_loss_weighting=getattr(args, 'scale_loss_weighting', 'token'),
         scale0_query_source=getattr(args, 'scale0_query_source', 'sos'),
         # ---- LR conditioning source ----

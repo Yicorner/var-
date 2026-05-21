@@ -115,7 +115,8 @@ class SRVAR(nn.Module):
         diffloss_d: int = 3,
         diff_steps: str = "100",
         diffloss_batch_mul: int = 4,
-        diffloss_sample_clip_denoised: bool = False,
+        diffloss_sample_clip_denoised: bool = True,
+        continuous_head_type: str = 'diffloss',
         scale_loss_weighting: str = 'token',
         scale0_query_source: str = 'sos',
         # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
@@ -246,6 +247,9 @@ class SRVAR(nn.Module):
         # new training path always uses the DiffLoss head below regardless.
         self.use_diff = True
         self.diffloss_batch_mul = int(max(1, diffloss_batch_mul))
+        assert continuous_head_type in ('diffloss', 'mse'), \
+            f"continuous_head_type must be 'diffloss' or 'mse', got {continuous_head_type!r}"
+        self.continuous_head_type = continuous_head_type
         assert scale_loss_weighting in ('token', 'equal_scale'), \
             f"scale_loss_weighting must be 'token' or 'equal_scale', got {scale_loss_weighting!r}"
         assert scale0_query_source in ('sos', 'low_f_pool'), \
@@ -366,6 +370,8 @@ class SRVAR(nn.Module):
         self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=norm_layer, fused_norm_func=fused_norm_func)
         # Linear C -> C: gives DiffLoss a dedicated projection without bloating params.
         self.head = nn.Linear(self.C, self.C)
+        if self.continuous_head_type == 'mse':
+            self.direct_head = nn.Linear(self.C, vae_local.Cvae)
         
         self.num_block_chunks = block_chunks or 1
         self.num_blocks_in_a_chunk = depth // block_chunks
@@ -383,20 +389,22 @@ class SRVAR(nn.Module):
             f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
-        # MAR-style per-token DiffLoss head.
-        # target_channels = Cvae   (continuous latent dim per token)
-        # z_channels      = self.C (DiffLoss condition dim, = embed_dim)
-        self.diffloss = DiffLoss(
-            target_channels=vae_local.Cvae,
-            z_channels=self.C,
-            depth=int(diffloss_d),
-            width=int(diffloss_w),
-            num_sampling_steps=str(diff_steps),
-            grad_checkpointing=(self.checkpointing == 'full-block'),
-            sample_clip_denoised=bool(diffloss_sample_clip_denoised),
-        )
+        if self.continuous_head_type == 'diffloss':
+            # MAR-style per-token DiffLoss head.
+            # target_channels = Cvae   (continuous latent dim per token)
+            # z_channels      = self.C (DiffLoss condition dim, = embed_dim)
+            self.diffloss = DiffLoss(
+                target_channels=vae_local.Cvae,
+                z_channels=self.C,
+                depth=int(diffloss_d),
+                width=int(diffloss_w),
+                num_sampling_steps=str(diff_steps),
+                grad_checkpointing=(self.checkpointing == 'full-block'),
+                sample_clip_denoised=bool(diffloss_sample_clip_denoised),
+            )
         print(
-            f'[srvar config] scale0_query_source={self.scale0_query_source}, '
+            f'[srvar config] continuous_head_type={self.continuous_head_type}, '
+            f'scale0_query_source={self.scale0_query_source}, '
             f'scale_loss_weighting={self.scale_loss_weighting}, '
             f'diffloss_batch_mul={self.diffloss_batch_mul}, '
             f'diffloss_sample_clip_denoised={bool(diffloss_sample_clip_denoised)}',
@@ -649,9 +657,12 @@ class SRVAR(nn.Module):
                 )                                                       # [B, pn_tokens, D]
                 z_BlD = self.get_logits(BlV[:B], cond_BD[:B])           # [B, pn_tokens, D]
 
-                # Per-token DiffLoss sampling.
+                # Per-token continuous latent prediction.
                 z_flat = z_BlD.reshape(-1, z_BlD.shape[-1]).contiguous() # [B*pn, D]
-                h_flat = self.diffloss.sample(z_flat, temperature=temperature, cfg=cfg)
+                if self.continuous_head_type == 'mse':
+                    h_flat = self.direct_head(z_flat)
+                else:
+                    h_flat = self.diffloss.sample(z_flat, temperature=temperature, cfg=cfg)
                 h_BChw = h_flat.reshape(B, pn_h, pn_w, vae.Cvae).permute(0, 3, 1, 2).contiguous()
 
                 ret.append(h_BChw)
@@ -861,7 +872,7 @@ class SRVAR(nn.Module):
         # ---- 4. project to DiffLoss condition `z` ----
         z_BLD = self.get_logits(x_BLC[:, :l_end], cond_BD)        # [B, L, D=C]
 
-        # ---- 5. build target tensor and call DiffLoss ----
+        # ---- 5. build target tensor and call the continuous head loss ----
         # Target tokens are laid out scale-by-scale to match the transformer order.
         # For scale `si`, target[si] has `pn^2` tokens of dim Cvae.
         target_list: List[torch.Tensor] = []
@@ -892,6 +903,13 @@ class SRVAR(nn.Module):
                     mask_BL[:, ptr:ptr + n] = 1.0 / max(1, n)
                 ptr += n
             loss_mask = mask_BL.reshape(-1)
+
+        if self.continuous_head_type == 'mse':
+            pred_flat = self.direct_head(z_flat)
+            loss_per_token = (pred_flat.float() - tgt_flat.float()).square().mean(dim=1)
+            if loss_mask is not None:
+                return (loss_per_token * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+            return loss_per_token.mean()
 
         # MAR-style diffloss_batch_mul: repeat the per-token pairs to reduce variance.
         mul = self.diffloss_batch_mul if self.training else 1
@@ -938,6 +956,10 @@ class SRVAR(nn.Module):
                 self.head[-1].weight.data.mul_(scale_head)
                 if self.head[-1].bias is not None:
                     self.head[-1].bias.data.zero_()
+            if hasattr(self, 'direct_head'):
+                self.direct_head.weight.data.mul_(scale_head)
+                if self.direct_head.bias is not None:
+                    self.direct_head.bias.data.zero_()
         
         depth = len(self.unregistered_blocks)
         for block_idx, sab in enumerate(self.unregistered_blocks): 
@@ -964,7 +986,8 @@ class SRVAR(nn.Module):
             elif hasattr(sab, 'ada_gss'):
                 sab.ada_gss.data[:, :, :2, :].mul_(aln_gamma_init)  # init gamma
                 sab.ada_gss.data[:, :, 2:, :].mul_(aln_init)        # init scale and shift
-        self._assert_diffloss_final_layer_zero()
+        if hasattr(self, 'diffloss'):
+            self._assert_diffloss_final_layer_zero()
 
     def _assert_diffloss_final_layer_zero(self):
         final_layer = self.diffloss.net.final_layer
