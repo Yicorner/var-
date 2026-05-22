@@ -125,6 +125,21 @@ class SRVARTrainer(object):
         )
 
     @staticmethod
+    def _format_per_scale_latent_stats(stats) -> str:
+        if not stats:
+            return ''
+        parts = []
+        for idx, item in enumerate(stats):
+            si = int(item.get('scale', idx))
+            h = int(item.get('h', 0))
+            w = int(item.get('w', 0))
+            n = int(item.get('tokens', 0))
+            mse = float(item.get('mse', float('nan')))
+            psnr = float(item.get('psnr', float('nan')))
+            parts.append(f's{si}({h}x{w},n={n}):mse={mse:.4e},psnr={psnr:.2f}dB')
+        return ' | '.join(parts)
+
+    @staticmethod
     def _should_run_event(it: int, metric_lg: MetricLogger, interval: int) -> bool:
         return (
             it == 0
@@ -383,6 +398,13 @@ class SRVARTrainer(object):
                 except Exception as e:
                     if dist.is_master():
                         print(f'[train_step] reconstruction/diagnostics skipped: {e}')
+
+        if (log_event or diag_event) and dist.is_master():
+            per_scale_log = self._format_per_scale_latent_stats(
+                getattr(self.srvar_wo_ddp, 'latest_per_scale_stats', None)
+            )
+            if per_scale_log:
+                print(f'[train per-scale latent ep={ep} it={it}] {per_scale_log}', flush=True)
 
         if g_it == 0 or (g_it + 1) % 500 == 0:
             if dist.is_master():

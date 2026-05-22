@@ -256,6 +256,7 @@ class SRVAR(nn.Module):
             f"scale0_query_source must be 'sos' or 'low_f_pool', got {scale0_query_source!r}"
         self.scale_loss_weighting = scale_loss_weighting
         self.scale0_query_source = scale0_query_source
+        self.latest_per_scale_stats: List[Dict[str, float]] = []
 
         self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
@@ -904,9 +905,14 @@ class SRVAR(nn.Module):
                 ptr += n
             loss_mask = mask_BL.reshape(-1)
 
+        self.latest_per_scale_stats = []
         if self.continuous_head_type == 'mse':
             pred_flat = self.direct_head(z_flat)
             loss_per_token = (pred_flat.float() - tgt_flat.float()).square().mean(dim=1)
+            self._record_per_scale_mse_stats(
+                loss_per_token.reshape(B, target_BLC.shape[1]),
+                scale_schedule,
+            )
             if loss_mask is not None:
                 return (loss_per_token * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
             return loss_per_token.mean()
@@ -921,6 +927,30 @@ class SRVAR(nn.Module):
 
         loss = self.diffloss(target=tgt_flat, z=z_flat, mask=loss_mask)
         return loss
+
+    def _record_per_scale_mse_stats(
+        self,
+        loss_per_token_BL: torch.Tensor,
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> None:
+        """Cache raw per-scale latent MSE diagnostics for the latest forward pass."""
+        stats: List[Dict[str, float]] = []
+        with torch.no_grad():
+            ptr = 0
+            for si, pn in enumerate(scale_schedule):
+                n = int(pn[0] * pn[1] * pn[2])
+                mse = loss_per_token_BL[:, ptr:ptr + n].detach().float().mean()
+                psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+                stats.append({
+                    'scale': float(si),
+                    'tokens': float(n),
+                    'h': float(pn[1]),
+                    'w': float(pn[2]),
+                    'mse': float(mse.item()),
+                    'psnr': float(psnr.item()),
+                })
+                ptr += n
+        self.latest_per_scale_stats = stats
         
     def load_state_dict(self, state_dict: Dict[str, Any], strict=False, assign=False):
         for k in state_dict:
