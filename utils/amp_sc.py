@@ -179,9 +179,40 @@ class AmpOptimizer:
             'scaler': self.scaler.state_dict(),
             'optimizer': self.optimizer.state_dict()
         }
+
+    @staticmethod
+    def _optimizer_state_compatible(optimizer: torch.optim.Optimizer, ckpt_opt: dict) -> bool:
+        ckpt_groups = ckpt_opt.get('param_groups', ())
+        if len(optimizer.param_groups) != len(ckpt_groups):
+            return False
+        for cur_g, ckpt_g in zip(optimizer.param_groups, ckpt_groups):
+            if len(cur_g['params']) != len(ckpt_g['params']):
+                return False
+        return True
     
     def load_state_dict(self, state, strict=True):
         if self.scaler is not None:
             try: self.scaler.load_state_dict(state['scaler'])
             except Exception as e: print(f'[fp16 load_state_dict err] {e}')
-        self.optimizer.load_state_dict(state['optimizer'])
+        ckpt_opt = state.get('optimizer')
+        if ckpt_opt is None:
+            return
+        if not self._optimizer_state_compatible(self.optimizer, ckpt_opt):
+            msg = (
+                f'[{self.model_name_3letters} optimizer] ckpt param_groups do not match the current '
+                f'optimizer (model architecture or param grouping changed); skip optimizer state '
+                f'and reinitialize Adam moments.'
+            )
+            if strict:
+                raise ValueError(msg)
+            print(f'[WARN] {msg}')
+            return
+        try:
+            self.optimizer.load_state_dict(ckpt_opt)
+        except ValueError as e:
+            if strict:
+                raise
+            print(
+                f'[WARN] [{self.model_name_3letters} optimizer] failed to load optimizer state ({e}); '
+                f'skip and reinitialize Adam moments.'
+            )
