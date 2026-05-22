@@ -82,6 +82,7 @@ DIAGNOSTICS_INTERVAL=${DIAGNOSTICS_INTERVAL:-${diagnostics_interval:-0}}
 DIAGNOSTICS_DIR_NAME=${DIAGNOSTICS_DIR_NAME:-${diagnostics_dir_name:-diagnostics}}
 DIAGNOSTICS_MAX_SAMPLES=${DIAGNOSTICS_MAX_SAMPLES:-${diagnostics_max_samples:-4}}
 DIAGNOSTICS_SAMPLE_SCALE0=${DIAGNOSTICS_SAMPLE_SCALE0:-${diagnostics_sample_scale0:-True}}
+AUTO_RESUME=${AUTO_RESUME:-${auto_resume:-True}}
 
 # Compose stage1 path additions only when STAGE1_CKPT is non-empty.
 STAGE1_ARGS=()
@@ -132,6 +133,7 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --diagnostics_dir_name="$DIAGNOSTICS_DIR_NAME" \
   --diagnostics_max_samples="$DIAGNOSTICS_MAX_SAMPLES" \
   --diagnostics_sample_scale0="$DIAGNOSTICS_SAMPLE_SCALE0" \
+  --auto_resume="$AUTO_RESUME" \
   --use_ref=False \
   "${STAGE1_ARGS[@]}"
 

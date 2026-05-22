@@ -191,6 +191,7 @@ class Args(Tap):
     tb_log_dir_path: str = '...tb-...'  # [automatically set; don't specify this]
     log_txt_path: str = '...'           # [automatically set; don't specify this]
     last_ckpt_path: str = '...'         # [automatically set; don't specify this]
+    auto_resume: bool = True            # load latest ar-ckpt*.pth from local_out_dir_path if present
     
     tf32: bool = True       # whether to use TensorFloat32
     device: str = 'cpu'     # [automatically set; don't specify this]
