@@ -362,15 +362,24 @@ def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], in
         return info, 0, 0, {}, {}
 
     if not os.path.isfile(resume_path):
-        info.append(f'[auto_resume] checkpoint not found @ {resume_path}')
+        msg = f'[auto_resume] checkpoint not found @ {resume_path}'
+        info.append(msg)
         info.append('[auto_resume quit]')
+        if getattr(args, 'resume', '').strip():
+            raise FileNotFoundError(
+                f'--resume was set but checkpoint does not exist: {resume_path}\n'
+                f'Hint: epoch snapshots are often named ckpt-{{ep}}.pth; rolling saves use ar-ckpt-last.pth / ar-ckpt-best.pth.'
+            )
         return info, 0, 0, {}, {}
 
     try:
         ckpt = torch.load(resume_path, map_location='cpu')
     except Exception as e:
-        info.append(f'[auto_resume] failed, {e} @ {resume_path}')
+        msg = f'[auto_resume] failed, {e} @ {resume_path}'
+        info.append(msg)
         info.append('[auto_resume quit]')
+        if getattr(args, 'resume', '').strip():
+            raise RuntimeError(msg) from e
         return info, 0, 0, {}, {}
 
     ep, it = ckpt['epoch'], ckpt['iter']

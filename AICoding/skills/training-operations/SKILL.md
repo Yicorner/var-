@@ -87,7 +87,9 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 
 **`BED` 与 resume 解耦**：`--resume` 只决定**从哪里读权重**；新 ckpt / 日志 / 重建图仍写到当前 `BED`。可从 run A 的 ckpt 恢复，同时把输出写到 run B 的目录。
 
-**自动恢复的范围**：glob 只匹配 `ar-ckpt*.pth`（如 `ar-ckpt-last.pth`、`ar-ckpt-best.pth`），**不会**自动选中 `ckpt-{ep}.pth`；若要 resume 后者，必须显式 `--resume=.../ckpt-8.pth`。
+**自动恢复的范围**：glob 只匹配 `ar-ckpt*.pth`（如 `ar-ckpt-last.pth`、`ar-ckpt-best.pth`），**不会**自动选中 `ckpt-{ep}.pth`；若要 resume 后者，必须显式 `--resume=.../ckpt-8.pth`（注意文件名是 `ckpt-2.pth` 而非 `ar-ckpt-2.pth`）。
+
+**显式 `--resume` 失败即退出**：路径不存在或 `torch.load` 失败时会 `raise`，避免误从头训练。自动 glob 找不到 ckpt 时仍静默从 ep0 开始。
 
 **`BED` 还负责**（与 resume 无关）：`log.txt`、`stdout.txt`/`stderr.txt`、TensorBoard 子目录、`{reconstruction_dir_name}/`、`{diagnostics_dir_name}/`、周期性保存的 `ar-ckpt-last.pth` / `ar-ckpt-best.pth` / `ckpt-{ep}.pth`。
 

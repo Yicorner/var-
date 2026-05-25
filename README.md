@@ -317,7 +317,7 @@ DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
 VAE_CKPT=/home/featurize/work/myvaex/local_output/test/test_stage2_with_alignment_epoch3/ckpt-2.pth \
 PATCH_NUMS_STR="4 5 6 8 10 13 16" \
 RECON_DIR_NAME=mse_token_cfg0_long \
-VAL_AND_SAVING_PER_EP=1 \
+VAL_AND_SAVING_PER_EP=2 \
 VAE_CH=160 \
 BS=64 \
 AC=16 \
@@ -331,8 +331,6 @@ TRAIN_LOG_POINTS_PER_EPOCH=64 \
 DIAGNOSTICS_ENABLED=True \
 DIAGNOSTICS_INTERVAL=500 \
 DIAGNOSTICS_DIR_NAME=mse_token_cfg0_long/diagnostics \
-AUTO_RESUME=True \
-RESUME=local_output/test/test_srvar_mse_head_scale0_sanity_per-token_loss/ar-ckpt-last.pth \
 EP=8 \
 bash SRtrain.sh
 ```
