@@ -187,7 +187,8 @@ class SRVARTrainer(object):
         diff_loss_sum = 0.0
         psnr_sum = 0.0
         ssim_sum = 0.0
-        ar_count = 0
+        ar_batches = 0
+        ar_samples = 0
         stt = time.time()
         training = self.srvar_wo_ddp.training
         self.srvar_wo_ddp.eval()
@@ -221,7 +222,7 @@ class SRVARTrainer(object):
             tot += B
 
             # AR-based PSNR/SSIM on a few batches.
-            if ar_count < eval_ar_max_batches:
+            if ar_batches < eval_ar_max_batches:
                 try:
                     from utils.image_saver import compute_psnr_ssim
                     rec_img = self._quick_reconstruction(
@@ -231,7 +232,8 @@ class SRVARTrainer(object):
                     metrics = compute_psnr_ssim(rec_img, inp_B3HW_super)
                     psnr_sum += metrics['psnr_mean'] * B
                     ssim_sum += metrics['ssim_mean'] * B
-                    ar_count += 1
+                    ar_batches += 1
+                    ar_samples += B
                 except Exception as e:
                     if dist.is_master():
                         print(f'[eval_ep] AR inference failed on batch {batch_idx}: {e}')
@@ -239,16 +241,16 @@ class SRVARTrainer(object):
         self.srvar_wo_ddp.train(training)
 
         stats = torch.tensor(
-            [diff_loss_sum, psnr_sum, ssim_sum, float(tot), float(ar_count)],
+            [diff_loss_sum, psnr_sum, ssim_sum, float(tot), float(ar_samples)],
             device=dist.get_device(),
         )
         dist.allreduce(stats)
         tot = int(round(stats[3].item())) or 1
-        ar_count_total = int(round(stats[4].item())) or 1
+        ar_samples_total = int(round(stats[4].item()))
         diff_loss = float(stats[0].item() / tot)
         # AR metrics are averaged over batches that actually ran AR.
-        psnr_mean = float(stats[1].item() / max(1, tot)) if ar_count > 0 else 0.0
-        ssim_mean = float(stats[2].item() / max(1, tot)) if ar_count > 0 else 0.0
+        psnr_mean = float(stats[1].item() / max(1, ar_samples_total)) if ar_samples_total > 0 else 0.0
+        ssim_mean = float(stats[2].item() / max(1, ar_samples_total)) if ar_samples_total > 0 else 0.0
         return diff_loss, psnr_mean, ssim_mean, tot, time.time() - stt
 
     @torch.no_grad()
