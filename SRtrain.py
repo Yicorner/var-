@@ -28,12 +28,8 @@ from utils.lr_control import filter_params
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def build_everything(args: arg_util.Args):
-    # resume
-    if args.auto_resume:
-        auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
-    else:
-        auto_resume_info = ['[auto_resume] disabled by --auto_resume=False']
-        start_ep, start_it, trainer_state, args_state = 0, 0, {}, {}
+    # resume: --resume takes precedence; else fall back to latest ckpt under BED when auto_resume=True
+    auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
     # =============== build logger ===============
     tb_lg: misc.TensorboardLogger
     with_tb_lg = dist.is_master()

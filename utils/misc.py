@@ -343,18 +343,39 @@ def glob_with_latest_modified_first(pattern, recursive=False):
 
 def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], int, int, dict, dict]:
     info = []
-    file = os.path.join(args.local_out_dir_path, pattern)
-    all_ckpt = glob_with_latest_modified_first(file)
-    if len(all_ckpt) == 0:
-        info.append(f'[auto_resume] no ckpt found @ {file}')
-        info.append(f'[auto_resume quit]')
-        return info, 0, 0, {}, {}
+    resume_path = None
+    if getattr(args, 'resume', '').strip():
+        resume_path = args.resume.strip()
+        info.append(f'[auto_resume] load from --resume @ {resume_path} ...')
+    elif args.auto_resume:
+        file = os.path.join(args.local_out_dir_path, pattern)
+        all_ckpt = glob_with_latest_modified_first(file)
+        if len(all_ckpt) == 0:
+            info.append(f'[auto_resume] no ckpt found @ {file}')
+            info.append(f'[auto_resume quit]')
+            return info, 0, 0, {}, {}
+        resume_path = all_ckpt[0]
+        info.append(f'[auto_resume] load ckpt from @ {resume_path} ...')
     else:
-        info.append(f'[auto_resume] load ckpt from @ {all_ckpt[0]} ...')
-        ckpt = torch.load(all_ckpt[0], map_location='cpu')
-        ep, it = ckpt['epoch'], ckpt['iter']
-        info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
-        return info, ep, it, ckpt['trainer'], ckpt['args']
+        info.append('[auto_resume] disabled by --auto_resume=False')
+        info.append('[auto_resume quit]')
+        return info, 0, 0, {}, {}
+
+    if not os.path.isfile(resume_path):
+        info.append(f'[auto_resume] checkpoint not found @ {resume_path}')
+        info.append('[auto_resume quit]')
+        return info, 0, 0, {}, {}
+
+    try:
+        ckpt = torch.load(resume_path, map_location='cpu')
+    except Exception as e:
+        info.append(f'[auto_resume] failed, {e} @ {resume_path}')
+        info.append('[auto_resume quit]')
+        return info, 0, 0, {}, {}
+
+    ep, it = ckpt['epoch'], ckpt['iter']
+    info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
+    return info, ep, it, ckpt['trainer'], ckpt['args']
 
 
 def create_npz_from_sample_folder(sample_folder: str):

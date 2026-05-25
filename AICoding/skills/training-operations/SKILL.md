@@ -69,6 +69,45 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `diagnostics_dir_name` | `diagnostics` | 诊断图输出子目录 |
 | `diagnostics_sample_scale0` | True | 是否额外只采样 scale[0] 并 decode |
 
+### 1.6 Resume / BED / auto_resume
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `local_out_dir_path` | `local_output` | 实验输出根目录；`SRtrain.sh` 环境变量为 **`BED`** |
+| `resume` | `""` | 显式指定要加载的 checkpoint 路径（`SRtrain.sh` 环境变量为 **`RESUME`**） |
+| `auto_resume` | True | 仅当 `resume` 为空时生效：在 `BED` 下按修改时间取最新的 `ar-ckpt*.pth` |
+
+**恢复优先级**（实现：`utils/misc.py::auto_resume`，`SRtrain.py` 固定 pattern=`ar-ckpt*.pth`）：
+
+| 优先级 | 条件 | 行为 |
+|---|---|---|
+| 1 | `--resume` 非空 | 从该路径加载；**不**在 `BED` 里搜索 |
+| 2 | `--resume` 为空 且 `auto_resume=True` | 在 `{BED}/ar-ckpt*.pth` 中取 mtime 最新者 |
+| 3 | 其余 | 不恢复，`start_ep=0, start_it=0` |
+
+**`BED` 与 resume 解耦**：`--resume` 只决定**从哪里读权重**；新 ckpt / 日志 / 重建图仍写到当前 `BED`。可从 run A 的 ckpt 恢复，同时把输出写到 run B 的目录。
+
+**自动恢复的范围**：glob 只匹配 `ar-ckpt*.pth`（如 `ar-ckpt-last.pth`、`ar-ckpt-best.pth`），**不会**自动选中 `ckpt-{ep}.pth`；若要 resume 后者，必须显式 `--resume=.../ckpt-8.pth`。
+
+**`BED` 还负责**（与 resume 无关）：`log.txt`、`stdout.txt`/`stderr.txt`、TensorBoard 子目录、`{reconstruction_dir_name}/`、`{diagnostics_dir_name}/`、周期性保存的 `ar-ckpt-last.pth` / `ar-ckpt-best.pth` / `ckpt-{ep}.pth`。
+
+示例：
+
+```bash
+# 从指定 ckpt 恢复，输出仍写到当前 BED
+RESUME=/path/to/old_run/ar-ckpt-last.pth \
+BED=local_output/my_new_run \
+bash SRtrain.sh
+
+# 在 BED 内自动找最新 ar-ckpt*.pth（默认行为）
+BED=local_output/my_run AUTO_RESUME=True bash SRtrain.sh
+
+# 完全从头训练
+AUTO_RESUME=False RESUME= bash SRtrain.sh
+```
+
+**易错**：多行 `VAR=val \` 命令若某行末尾缺 `\`，后续变量不会传给 `bash SRtrain.sh`；`BED=...` 行后建议也加 `\`。启动后核对日志里 `data_path`、`lr_folder`、`resume`、`local_out_dir_path` 是否与预期一致。
+
 ---
 
 ## 2. SRtrain.sh 套壳变量
@@ -89,6 +128,7 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | 验证/重建 | `VAL_AND_SAVING_PER_EP` / `RECON_SAVE_INTERVAL` / `RECON_MAX_SAMPLES` / `RECON_DIR_NAME` / `EVAL_AR_MAX_BATCHES` | 2 / 0 / 4 / `reconstruction_samples` / 4 |
 | 日志 | `TRAIN_LOG_POINTS_PER_EPOCH` | 32 |
 | 诊断 | `DIAGNOSTICS_ENABLED` / `DIAGNOSTICS_INTERVAL` / `DIAGNOSTICS_DIR_NAME` / `DIAGNOSTICS_SAMPLE_SCALE0` | True / 0 / `diagnostics` / True |
+| 恢复 | `RESUME` / `AUTO_RESUME` | `""` / `True` |
 
 ---
 
@@ -119,13 +159,13 @@ log iter 时（每 epoch 大约 `TRAIN_LOG_POINTS_PER_EPOCH` 次，默认 32）�
 
 文件：`utils/image_saver.py`（直接搬 myvaex 同名工具，**改 1 处**：`nrow=3` 三列 `LR_upsampled | HR_pred | HR_gt`）。
 
-- 保存路径：`bed/{exp_name}/{reconstruction_dir_name}/epXXXX_itYYYYYY_comparison.png`
+- 保存路径：`{BED}/{reconstruction_dir_name}/epXXXX_itYYYYYY_comparison.png`（`EXP_NAME` 不参与路径）
 - 触发条件：`it == 0 or it in metric_lg.log_iters or (reconstruction_save_interval>0 and it % reconstruction_save_interval == 0)`
 - `run_metadata.json` 字段：`stage_name="SRVAR continuous AR"`、`save_dir`、`filename_pattern`、`frequency_description`、`comparison_layout="3 columns per row: LR_upsampled | HR_pred | HR_gt"`、`max_samples_per_image`、`postprocess`、`args`（整个 `Args.state_dict()`）。
 
 诊断图：
 
-- 保存路径：`bed/{diagnostics_dir_name}/epXXXX_itYYYYYY_diagnostic.png`
+- 保存路径：`{BED}/{diagnostics_dir_name}/epXXXX_itYYYYYY_diagnostic.png`
 - 触发条件：`diagnostics_enabled=True` 且 `it == 0 or it in metric_lg.log_iters or (diagnostics_interval>0 and it % diagnostics_interval == 0)`。
 - 布局：`LR_upsampled | AR_full | AR_scale0_only | VAE_oracle | HR_gt`。
 - `VAE_oracle`：HR 经冻结 VAE 得到 target latent 后直接 decode，是 VAE ckpt 自身重建上限。
@@ -149,28 +189,33 @@ ssim = structural_similarity(inp_norm, rec_norm, data_range=1.0, channel_axis=2)
 
 ---
 
-## 6. Checkpoint
+## 6. Checkpoint 与恢复训练
 
-每隔 `val_and_saving_per_ep` epoch 保存：
+每隔 `val_and_saving_per_ep` epoch 保存（`SRtrain.py`，仅 local master）：
 
 ```python
 state = {
-  'epoch': ep,
-  'iter': g_it,
-  'trainer': SRVARTrainer.state_dict(),     # 包含 srvar_wo_ddp, vae_local, var_opt
+  'epoch': ep + 1,
+  'iter': 0,
+  'trainer': SRVARTrainer.state_dict(),   # srvar_wo_ddp, vae_local, var_opt；加载时 skip_vae=True
   'args': args.state_dict(),
 }
 ```
 
-- `ckpt-last.pth` 持续覆盖
-- `ckpt-best.pth` 跟踪 val PSNR 最高
-- 恢复训练用 `--resume=path/to/ckpt.pth`
+| 文件名 | 说明 |
+|---|---|
+| `ar-ckpt-last.pth` | 每次验证后覆盖，**自动 resume 默认匹配此模式** |
+| `ar-ckpt-best.pth` | val diff loss 最优时从 last 复制 |
+| `ckpt-{ep}.pth` | 每 epoch 额外留档；**不会**被 `auto_resume` 自动选中 |
+
+恢复逻辑见 **§1.6**。`trainer.load_state_dict(trainer_state, strict=False, skip_vae=True)`——冻结 VAE 权重以当前 `--vae_ckpt` 为准，不沿用 ckpt 内 VAE。
 
 ---
 
+
 ## 7. 排查顺序
 
-1. 启动期 assert：`patch_nums` 与 stage2 ckpt 一致、`low_len` 与 `tlen` 兼容、`lr_cond_source` 与 `lr_folder` / `stage1_ckpt` 兼容。
+1. 启动期 assert：`patch_nums` 与 stage2 ckpt 一致、`low_len` 与 `tlen` 兼容、`lr_cond_source` 与 `lr_folder` / `stage1_ckpt` 兼容；核对 `[auto_resume]` 日志是否从预期的 `--resume` 或 `BED` 路径加载。
 2. 看启动日志：`[diffloss init]` 的 final layer norm 应为 0 或接近 0；`scale0_query_source` / `scale_loss_weighting` 应符合本次实验预期。
 3. 看 `[KL Debug]` 风格的日志（连续 VAE 内部）：mean/logvar 是否漂移。
 4. 看 `loss` 是不是 NaN：DiffLoss 内 `learn_sigma` 在不稳定时可能出 inf；首先检查 `target` 是否冻结、形状是否一致。
