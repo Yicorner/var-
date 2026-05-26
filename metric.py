@@ -47,6 +47,8 @@ def process_image(x):
     x = x.detach().cpu().permute(0, 2, 3, 1).numpy()  # 转换为 HWC 格式的 numpy 数组
     x = (x * 0.5 + 0.5) * 255  # 反归一化并缩放到 [0, 255]
     x = x.astype(np.uint8)  # 转换为 uint8
+    if x.shape[-1] == 1:
+        x = x[..., 0]
     return x
 def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
     return x.add(x).add_(-1)
@@ -74,6 +76,9 @@ def rgb2ycbcr_pt(img, y_only=False):
     Returns:
         (Tensor): converted images with the shape (n, 3/1, h, w), the range [0, 1], float.
     """
+    if img.shape[1] == 1:
+        return img if y_only else img.repeat(1, 3, 1, 1)
+
     if y_only:
         weight = torch.tensor([[65.481], [128.553], [24.966]]).to(img)
         out_img = torch.matmul(img.permute(0, 2, 3, 1), weight).permute(0, 3, 1, 2) + 16.0
@@ -112,6 +117,7 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
         vocab_size=0, z_channels=Cvae, ch=ch, test_mode=True,
         share_quant_resi=share_quant_resi, v_patch_nums=patch_nums,
         quant_resi=getattr(args, 'quant_resi', 0.5),
+        img_channels=getattr(args, 'img_channels', 3),
     ).to(args.device)
     srvar_kw = dict(
         low_channel=args.Ct5, low_len=args.tlen,
@@ -205,6 +211,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
             for i in range(B):
                 _data = nup_gt[i]
                 _rec_B3HW = nup_test[i]
+                if _rec_B3HW.ndim == 3 and _rec_B3HW.shape[-1] == 1:
+                    _rec_B3HW = _rec_B3HW[..., 0]
                 Image.fromarray(_rec_B3HW).save(os.path.join(predict_dir, f"{idx*B+i}.png"))
                 Image.fromarray(_data).save(os.path.join(gt_dir, f"{idx*B+i}.png"))
 
@@ -303,6 +311,7 @@ if __name__ == "__main__":
     args.diffloss_batch_mul = 4
     args.cfg_infer = 1.0
     args.lr_cond_source = 'srvar_encoder'
+    args.img_channels = 3
     out_path = "./metric.txt"
 
     # Legacy args kept for `metric()`'s file-naming compatibility.
@@ -315,7 +324,7 @@ if __name__ == "__main__":
 
 
     dataset_train, dataset_val = build_dataset(
-        args.data_path,augment=False,use_ref=args.use_ref
+        args.data_path,augment=False,use_ref=args.use_ref,img_channels=args.img_channels
     )
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
 

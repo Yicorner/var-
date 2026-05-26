@@ -27,6 +27,7 @@ def build_vae_srvar(
         test_mode=True, share_quant_resi=share_quant_resi,
         v_patch_nums=patch_nums,
         quant_resi=getattr(args, 'quant_resi', 0.5),
+        img_channels=getattr(args, 'img_channels', 3),
     ).to(device)
 
     srvar_kw = dict(
@@ -92,7 +93,7 @@ def build_lr_vae(
     Only callers with non-empty `args.stage1_ckpt` should invoke this; checkpoint
     loading is performed in `SRtrain.py`.
     """
-    lr_vae = LR_VAE(z_channels=Cvae, ch=ch, test_mode=True).to(device)
+    lr_vae = LR_VAE(z_channels=Cvae, ch=ch, test_mode=True, img_channels=getattr(args, 'img_channels', 3)).to(device)
     assert all(not p.requires_grad for p in lr_vae.parameters()), \
         'LR_VAE must be fully frozen (test_mode=True).'
     return lr_vae

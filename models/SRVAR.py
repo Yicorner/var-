@@ -219,7 +219,7 @@ class SRVAR(nn.Module):
 
         ddconfig = dict(
             dropout=vae_local.dropout, ch=vae_local.ch, z_channels=vae_local.Cvae,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
+            in_channels=getattr(vae_local, 'img_channels', 3), ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )
         if self.lr_cond_source == 'srvar_encoder':
@@ -597,7 +597,7 @@ class SRVAR(nn.Module):
         Returns one of:
             (ret_list, []) if not `ret_img` and not `return_fhat`
             (ret_list, []) where the second slot is `(accu_BChw,)` if `return_fhat`
-            (ret_list, [], img) if `ret_img`; img is `[B, H, W, 3]` uint8.
+            (ret_list, [], img) if `ret_img`; img is `[B, H, W, img_channels]` uint8.
         """
         if g_seed is not None:
             self.rng.manual_seed(g_seed)
@@ -727,7 +727,7 @@ class SRVAR(nn.Module):
         """Training forward.
 
         Args:
-            inp_B3HW_low:   `[B, 3, H, W]` LR image, used only when
+            inp_B3HW_low:   `[B, img_channels, H, W]` LR image, used only when
                             `lr_cond_source='srvar_encoder'`.
             ms_h_target:    list of `[B, C, pn, pn]` per-scale posterior means; the
                             DiffLoss targets.

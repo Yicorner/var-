@@ -28,6 +28,13 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(img_np, mode='RGB')
 
 
+def tensor_to_metric_np_01(tensor: torch.Tensor) -> np.ndarray:
+    arr = ((tensor.detach().cpu().float().numpy() + 1.0) * 0.5).clip(0.0, 1.0)
+    if arr.shape[0] == 1:
+        return arr[0]
+    return np.transpose(arr, (1, 2, 0))
+
+
 def _resize_to(tensor: torch.Tensor, target_hw: torch.Size) -> torch.Tensor:
     """Resize `[N,C,h,w]` -> `[N,C,target_h,target_w]` using bicubic."""
     if tensor.shape[-2:] == target_hw:
@@ -182,7 +189,10 @@ def compute_psnr_ssim(
     hr_pred: torch.Tensor,
     hr_gt: torch.Tensor,
 ) -> Dict[str, float]:
-    """Compute PSNR/SSIM as in myvaex: skimage on RGB [0, 1], data_range=1.0.
+    """Compute PSNR/SSIM as in myvaex: skimage on [0, 1], data_range=1.0.
+
+    RGB tensors use HWC arrays with `channel_axis=2`; grayscale tensors use HW
+    arrays so SSIM is the true single-channel medical-image score.
 
     Args:
         hr_pred, hr_gt: `[B, C, H, W]` in [-1, 1].
@@ -206,11 +216,17 @@ def compute_psnr_ssim(
     psnrs: List[float] = []
     ssims: List[float] = []
     for i in range(pred.shape[0]):
-        p = np.transpose(pred[i], (1, 2, 0))     # HWC
-        g = np.transpose(gt[i], (1, 2, 0))
+        if pred.shape[1] == 1:
+            p = pred[i, 0]
+            g = gt[i, 0]
+        else:
+            p = np.transpose(pred[i], (1, 2, 0))     # HWC
+            g = np.transpose(gt[i], (1, 2, 0))
         psnrs.append(float(_psnr(g, p, data_range=1.0)))
-        # channel_axis=2 for HWC; SSIM requires same shape, default Gaussian window.
-        ssims.append(float(_ssim(g, p, data_range=1.0, channel_axis=2)))
+        if g.ndim == 2:
+            ssims.append(float(_ssim(g, p, data_range=1.0)))
+        else:
+            ssims.append(float(_ssim(g, p, data_range=1.0, channel_axis=2)))
 
     return {
         "psnr_mean": float(np.mean(psnrs)) if psnrs else 0.0,

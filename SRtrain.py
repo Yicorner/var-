@@ -27,6 +27,13 @@ from utils.lr_control import filter_params
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+
+def _read_ckpt_arg(ckpt: dict, key: str, default):
+    args_state = ckpt.get('args', {}) if isinstance(ckpt, dict) else {}
+    if isinstance(args_state, dict):
+        return args_state.get(key, default)
+    return default
+
 def build_everything(args: arg_util.Args):
     # resume: --resume takes precedence; else fall back to latest ckpt under BED when auto_resume=True
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
@@ -46,6 +53,19 @@ def build_everything(args: arg_util.Args):
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
+
+    assert args.vae_ckpt, '--vae_ckpt must be provided (myvaex stage2 ckpt path).'
+    vae_ckpt_blob = torch.load(args.vae_ckpt, map_location='cpu')
+    ckpt_img_channels = int(_read_ckpt_arg(vae_ckpt_blob, 'img_channels', args.img_channels))
+    if ckpt_img_channels != int(args.img_channels):
+        print(
+            f'[img_channels] overriding args.img_channels={args.img_channels} '
+            f'to match vae_ckpt args.img_channels={ckpt_img_channels}'
+        )
+        args.img_channels = ckpt_img_channels
+    args.img_channels = int(args.img_channels)
+    if args.img_channels not in (1, 3):
+        raise ValueError(f'img_channels must be 1 or 3, got {args.img_channels}')
     
     # =============== build dataset ===============
     print(f'[build PT data] ...\n')
@@ -61,6 +81,7 @@ def build_everything(args: arg_util.Args):
     dataset_train, dataset_val = build_dataset(
         args.data_path, augment=True, use_ref=args.use_ref,
         lr_folder=args.lr_folder, hr_folder=args.hr_folder, same_shape=args.same_shape,
+        img_channels=args.img_channels,
     )
     types = str((type(dataset_train).__name__, type(dataset_val).__name__))
     
@@ -100,8 +121,7 @@ def build_everything(args: arg_util.Args):
         share_quant_resi=args.share_quant_resi,
     )
 
-    assert args.vae_ckpt, '--vae_ckpt must be provided (myvaex stage2 ckpt path).'
-    vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
+    vae_ckpt = vae_ckpt_blob
     if isinstance(vae_ckpt, dict) and "trainer" in vae_ckpt.keys():
         # Try in priority order: vae_ema -> vae_wo_ddp -> vae -> first vae-like key.
         trainer_blob = vae_ckpt["trainer"]
@@ -141,7 +161,7 @@ def build_everything(args: arg_util.Args):
         # Validate scale[0] dimension agreement.
         if dist.is_master():
             with torch.no_grad():
-                dummy = torch.zeros(1, 3, 64, 64, device=dist.get_device())
+                dummy = torch.zeros(1, args.img_channels, 64, 64, device=dist.get_device())
                 lr_mean = lr_vae_local.encode_to_posterior_mean(dummy)
                 pn0 = args.patch_nums[0]
                 assert lr_mean.shape[-1] == pn0, (

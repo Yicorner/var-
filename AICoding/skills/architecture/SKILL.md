@@ -13,8 +13,8 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
 
 ```text
 [输入]
-  inp_B3HW_super:  [B, 3, 256, 256]   # HR
-  inp_B3HW_low:    [B, 3, 64, 64]     # LR_64x64（或 256）
+  inp_B3HW_super:  [B, img_channels, 256, 256]   # HR
+  inp_B3HW_low:    [B, img_channels, 64, 64]     # LR_64x64（或 256）
   ref_B3HW (opt):  同上
 
 [VAE 侧（torch.no_grad）]
@@ -83,7 +83,7 @@ for si, (t, h, w) in enumerate(scale_schedule):
         si, SN, accu_BChw, h_BChw)
     last_stage = word_embed(norm0_ve(next_input.view(B,C,-1).transpose(1,2)))
 
-img = vae.fhat_to_img(accu_BChw)     # [B, 3, 256, 256] in [-1, 1]
+img = vae.fhat_to_img(accu_BChw)     # [B, img_channels, 256, 256] in [-1, 1]
 ```
 
 `scale_schedule` 默认从 `dynamic_resolution_h_w["1M"]["scales"]` 取，但 **必须** 与 `vae.patch_nums` 长度一致；不一致就强制退回 `[(1, pn, pn) for pn in patch_nums]`。

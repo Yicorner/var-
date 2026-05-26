@@ -26,6 +26,7 @@ DATA_PATH=${DATA_PATH:-${data_path:-/home/why/qbh/dataset/brats_256_t2_2021_pair
 LR_FOLDER=${LR_FOLDER:-${lr_folder:-LR_64x64}}
 HR_FOLDER=${HR_FOLDER:-${hr_folder:-HR}}
 SAME_SHAPE=${SAME_SHAPE:-${same_shape:-False}}
+IMG_CHANNELS=${IMG_CHANNELS:-${img_channels:-3}}
 
 # -------- multi-scale (must match stage2 ckpt) --------
 PATCH_NUMS_STR=${PATCH_NUMS_STR:-${PATCH_NUMS:-${patch_nums:-"1 2 3 4 5 6 8 10 13 16"}}}
@@ -106,6 +107,7 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --data_path="$DATA_PATH" \
   --lr_folder="$LR_FOLDER" --hr_folder="$HR_FOLDER" \
   --same_shape="$SAME_SHAPE" \
+  --img_channels="$IMG_CHANNELS" \
   --patch_nums "${PATCH_NUMS[@]}" \
   --vae_ckpt="$VAE_CKPT" \
   --Ct5="$CVAE" --vae_ch="$VAE_CH" \

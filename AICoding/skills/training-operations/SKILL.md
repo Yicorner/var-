@@ -120,7 +120,7 @@ AUTO_RESUME=False RESUME= bash SRtrain.sh
 |---|---|---|
 | 实验 | `EXP_NAME` / `EXP_NOTE` / `BED` / `PORT` | 必填 / `""` / `local_output` / `13333` |
 | GPU | `CUDA_VISIBLE_DEVICES` | `0` |
-| 数据 | `DATA_PATH` / `LR_FOLDER` / `HR_FOLDER` | 必填 / `LR_64x64` / `HR` |
+| 数据 | `DATA_PATH` / `LR_FOLDER` / `HR_FOLDER` / `IMG_CHANNELS` | 必填 / `LR_64x64` / `HR` / `3` |
 | 多尺度 | `PATCH_NUMS_STR` | `"1 2 3 4 5 6 8 10 13 16"`（**必须**与 ckpt 一致） |
 | VAE | `VAE_CKPT` / `CVAE` / `VAE_CH` / `QUANT_RESI` / `SHARE_QUANT_RESI` | 必填 / 32 / 128 / 0.5 / 4 |
 | stage1 | `STAGE1_CKPT` / `LR_COND_SOURCE` / `SKIP_SCALE0_LOSS` | `""` / `srvar_encoder` / `False` |
@@ -131,6 +131,8 @@ AUTO_RESUME=False RESUME= bash SRtrain.sh
 | 日志 | `TRAIN_LOG_POINTS_PER_EPOCH` | 32 |
 | 诊断 | `DIAGNOSTICS_ENABLED` / `DIAGNOSTICS_INTERVAL` / `DIAGNOSTICS_DIR_NAME` / `DIAGNOSTICS_SAMPLE_SCALE0` | True / 0 / `diagnostics` / True |
 | 恢复 | `RESUME` / `AUTO_RESUME` | `""` / `True` |
+
+`IMG_CHANNELS=1` 用于单通道医学灰度图；`SRtrain.py` 会优先读取 `VAE_CKPT` 里的 `args.img_channels`，不一致时自动覆盖命令行值，避免上游 VAE 权重通道形状不匹配。
 
 ---
 
@@ -184,10 +186,11 @@ log iter 时（每 epoch 大约 `TRAIN_LOG_POINTS_PER_EPOCH` 次，默认 32）�
 inp_norm = (inp + 1.0) / 2.0; inp_norm = inp_norm.clamp(0, 1)
 rec_norm = (rec + 1.0) / 2.0; rec_norm = rec_norm.clamp(0, 1)
 psnr = peak_signal_noise_ratio(inp_norm, rec_norm, data_range=1.0)
-ssim = structural_similarity(inp_norm, rec_norm, data_range=1.0, channel_axis=2)
+ssim = structural_similarity(inp_norm, rec_norm, data_range=1.0, channel_axis=2)  # RGB
+# grayscale C=1 uses HW arrays and omits channel_axis
 ```
 
-与 myvaex 完全一致（RGB 通道，`[0,1]`，`data_range=1.0`）。
+与 myvaex 完全一致：`C=3` 时使用 RGB/HWC + `channel_axis=2`；`IMG_CHANNELS=1` 时使用灰度 `H x W`，仍然是 `[0,1]`、`data_range=1.0`。
 
 ---
 

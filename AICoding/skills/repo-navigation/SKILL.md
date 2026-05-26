@@ -76,7 +76,7 @@ description: Route readers to the correct var/ skill before they dive into detai
 
 - `SRtrain.sh` 套壳变量都有哪些
 - 训练循环、log iter、`save_reconstruction_comparison` + `run_metadata.json` 怎么生成
-- PSNR / SSIM 在哪算（与 myvaex 一致，RGB 0-1，skimage）
+- PSNR / SSIM 在哪算（与 myvaex 一致：RGB 用 HWC，灰度 `IMG_CHANNELS=1` 用单通道 HW，均为 `[0,1]` + skimage）
 
 ---
 

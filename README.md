@@ -334,3 +334,36 @@ DIAGNOSTICS_DIR_NAME=mse_token_cfg0_long/diagnostics \
 EP=8 \
 bash SRtrain.sh
 ```
+
+## 9. 单通道医学影像模式
+
+`var/` 的 `IMG_CHANNELS` 必须和上游 myvaex stage2 VAE checkpoint 一致。默认是 `IMG_CHANNELS=3` 以兼容旧 RGB checkpoint；灰度医学影像实验请使用 `IMG_CHANNELS=1`，并传入同样用 `IMG_CHANNELS=1` 训练出来的 myvaex stage2 checkpoint。
+
+`SRtrain.py` 会优先读取 `VAE_CKPT` 中保存的 `args.img_channels`，如果和命令行不同，会自动覆盖成 checkpoint 的通道数，避免 VAE 权重形状对不上。数据加载、SRVAR 内部 encoder、SRVAR 推理解码都会跟随该通道数；PSNR / SSIM 在 `C=1` 时按真正灰度图计算。
+
+推荐灰度 SRVAR 命令：
+
+```bash
+EXP_NAME=srvar_gray_scale0_lrq_equal_loss \
+EXP_NOTE="single-channel SRVAR, LR-conditioned scale0 query + equal-scale DiffLoss" \
+IMG_CHANNELS=1 \
+LR_FOLDER=LR \
+SAME_SHAPE=False \
+DATA_PATH=/home/featurize/data/brats_256_t2_2021_pair_png_with_ref \
+VAE_CKPT=/home/featurize/work/myvaex/local_output/test/your_gray_stage2/ckpt-best.pth \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+RECON_DIR_NAME=srvar_gray_scale0_lrq_equal_loss \
+VAL_AND_SAVING_PER_EP=1 \
+VAE_CH=160 \
+BS=64 \
+AC=16 \
+LR=4e-4 \
+WP=0.05 \
+SCALE0_QUERY_SOURCE=low_f_pool \
+SCALE_LOSS_WEIGHTING=equal_scale \
+TRAIN_LOG_POINTS_PER_EPOCH=64 \
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_INTERVAL=500 \
+DIAGNOSTICS_SAMPLE_SCALE0=True \
+bash SRtrain.sh
+```

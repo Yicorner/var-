@@ -27,6 +27,14 @@ def is_image_file(filename, extensions):
     return any(filename.lower().endswith(ext) for ext in extensions)
 
 
+def pil_mode_from_channels(img_channels: int) -> str:
+    if int(img_channels) == 1:
+        return 'L'
+    if int(img_channels) == 3:
+        return 'RGB'
+    raise ValueError(f'img_channels must be 1 or 3, got {img_channels}')
+
+
 def center_crop_arr(images_list, image_size, min_crop_frac=0.9, max_crop_frac=1.0):
     """Center cropping (ADM style). Requires all images in `images_list` to have the same size."""
     assert len(images_list) > 0
@@ -87,6 +95,7 @@ class PairedImageDataset(Dataset):
         lr_folder: str = 'LR_64x64',
         hr_folder: str = 'HR',
         ref_folder: str = 'Ref',
+        img_channels: int = 3,
     ):
         self.low_dir = osp.join(root, lr_folder)
         self.super_dir = osp.join(root, hr_folder)
@@ -100,6 +109,7 @@ class PairedImageDataset(Dataset):
         self.same_shape = same_shape
         self.augment = augment
         self.use_ref = use_ref
+        self.image_mode = pil_mode_from_channels(img_channels)
 
         assert osp.isdir(self.low_dir), f'LR folder not found: {self.low_dir}'
         assert osp.isdir(self.super_dir), f'HR folder not found: {self.super_dir}'
@@ -116,12 +126,12 @@ class PairedImageDataset(Dataset):
         low_path = osp.join(self.low_dir, filename)
         super_path = osp.join(self.super_dir, filename)
 
-        low_img = Image.open(low_path).convert('RGB')
-        super_img = Image.open(super_path).convert('RGB')
+        low_img = Image.open(low_path).convert(self.image_mode)
+        super_img = Image.open(super_path).convert(self.image_mode)
 
         if self.use_ref:
             ref_path = osp.join(self.ref_dir, filename)
-            ref_img = Image.open(ref_path).convert('RGB')
+            ref_img = Image.open(ref_path).convert(self.image_mode)
 
         if self.same_shape and low_img.size != super_img.size:
             low_img = low_img.resize(super_img.size, Image.BICUBIC)
@@ -175,6 +185,7 @@ def build_dataset(
     hr_folder: str = 'HR',
     same_shape: bool = False,
     ref_folder: str = 'Ref',
+    img_channels: int = 3,
 ):
     train_aug = transforms.Compose([transforms.ToTensor(), normalize_01_into_pm1])
     val_aug = transforms.Compose([transforms.ToTensor(), normalize_01_into_pm1])
@@ -184,16 +195,18 @@ def build_dataset(
         transform=train_aug, augment=augment, use_ref=use_ref,
         lr_folder=lr_folder, hr_folder=hr_folder, ref_folder=ref_folder,
         same_shape=same_shape,
+        img_channels=img_channels,
     )
     val_set = PairedImageDataset(
         root=osp.join(data_path, 'val'), extensions=IMG_EXTENSIONS,
         transform=val_aug, augment=False, use_ref=use_ref,
         lr_folder=lr_folder, hr_folder=hr_folder, ref_folder=ref_folder,
         same_shape=same_shape,
+        img_channels=img_channels,
     )
 
     print(f'[Dataset] {len(train_set)=}, {len(val_set)=} '
-          f'(lr_folder={lr_folder}, hr_folder={hr_folder}, same_shape={same_shape})')
+          f'(image_mode={train_set.image_mode}, img_channels={img_channels}, lr_folder={lr_folder}, hr_folder={hr_folder}, same_shape={same_shape})')
     print_aug(train_aug, '[train]')
     print_aug(val_aug, '[val]')
     return train_set, val_set

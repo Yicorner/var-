@@ -143,3 +143,10 @@ ms_h_target -> [B*L, C] -+--> DiffLoss(target, z) -> scalar loss
 - LR 数据约定：`AICoding/skills/lr-data-conventions/`
 - 训练运维：`AICoding/skills/training-operations/`
 - 上游 myvaex 的训练与可视化约定：`myvaex/AICoding/skills/`
+
+## 7. 单通道灰度模式
+
+- `IMG_CHANNELS=1` / `--img_channels=1` 表示 LR、HR、可选 Ref 都按单通道医学灰度图读取和建模；默认 `3` 兼容旧 RGB 实验。
+- 该值必须和上游 myvaex stage2 `VAE_CKPT` 一致。`SRtrain.py` 会读取 checkpoint 中的 `args.img_channels` 并在不一致时覆盖命令行。
+- `models/vqvae.py`、`models/lr_vae.py`、`models/SRVAR.py` 都通过 VAE 的 `img_channels` 决定 encoder 输入和 decoder 输出通道。
+- PSNR / SSIM 与 myvaex 保持一致：灰度用 `H x W`，RGB 用 HWC + `channel_axis=2`。

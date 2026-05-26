@@ -307,7 +307,7 @@ class SRVARTrainer(object):
         cfg: float = 1.0,
         temperature: float = 1.0,
     ) -> Ten:
-        """Run AR sampling and return reconstructed HR `[B, 3, H, W]` in [-1, 1]."""
+        """Run AR sampling and return reconstructed HR `[B, img_channels, H, W]` in [-1, 1]."""
         rec, _, _ = self._sample_ar(
             inp_B3HW_low, scale_schedule, ref_B3HW, low_f_override,
             cfg=cfg, temperature=temperature,

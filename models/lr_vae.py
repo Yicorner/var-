@@ -28,15 +28,17 @@ class LR_VAE(nn.Module):
         beta: float = 1.0,
         quant_conv_ks: int = 3,
         test_mode: bool = True,
+        img_channels: int = 3,
     ):
         super().__init__()
         self.test_mode = test_mode
         self.Cvae = z_channels
         self.kl_weight = beta
+        self.img_channels = int(img_channels)
 
         ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4),
+            in_channels=self.img_channels, ch_mult=(1, 1, 2, 2, 4),
             num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )

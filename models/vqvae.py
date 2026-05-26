@@ -42,6 +42,7 @@ class VQVAE(nn.Module):
         v_patch_nums: Sequence[int] = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         test_mode: bool = True,
         debug_kl_count_limit: int = 0,
+        img_channels: int = 3,
     ):
         super().__init__()
         self.quant_conv_ks = quant_conv_ks
@@ -49,6 +50,7 @@ class VQVAE(nn.Module):
         self.ch = ch
         self.test_mode = test_mode
         self.Cvae = z_channels
+        self.img_channels = int(img_channels)
         # We keep `V` only as a numerical marker for log lines (some legacy code
         # accesses `vae_local.vocab_size`); continuous VAE has no codebook.
         self.V = int(vocab_size) if vocab_size else 0
@@ -57,7 +59,7 @@ class VQVAE(nn.Module):
         # The encoder/decoder match myvaex (vq-f16) and stage2 checkpoint layout.
         ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
+            in_channels=self.img_channels, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )
         ddconfig.pop('double_z', None)

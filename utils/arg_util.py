@@ -42,6 +42,7 @@ class Args(Tap):
     # LR conditioning
     lr_folder: str = 'LR_64x64'         # subdir under DATA_PATH/{train,val} for LR images
     hr_folder: str = 'HR'               # subdir under DATA_PATH/{train,val} for HR images
+    img_channels: int = 3               # raw image/model channels; set 1 for grayscale medical image checkpoints
     lr_cond_source: str = 'srvar_encoder'  # 'srvar_encoder' or 'lr_vae'
     stage1_ckpt: str = ''               # non-empty -> build & load LR_VAE
     skip_scale0_loss: bool = False      # plan-A only: drop scale[0] from DiffLoss target/z
