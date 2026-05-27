@@ -93,6 +93,7 @@ def save_diagnostic_comparison(
     hr_ar: torch.Tensor,
     hr_scale0: Optional[torch.Tensor],
     hr_scale0_oracle: Optional[torch.Tensor],
+    hr_stage3_scale0: Optional[torch.Tensor],
     hr_oracle: torch.Tensor,
     hr_gt: torch.Tensor,
     save_dir: str,
@@ -105,7 +106,8 @@ def save_diagnostic_comparison(
     `hr_oracle` is decoded from the frozen VAE target latents, so it is the upper
     bound for this VAE checkpoint. `hr_scale0` decodes the image after sampling
     only the first AR scale; `hr_scale0_oracle` decodes the true first-scale
-    target only. Either scale0 image can be `None` when disabled.
+    target only. `hr_stage3_scale0` decodes the frozen stage3 s0 prediction when
+    stage3 start mode is enabled. Any scale0 image can be `None` when disabled.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -115,6 +117,7 @@ def save_diagnostic_comparison(
     gt_denorm = denormalize_image(hr_gt.clone())
     scale0_denorm = denormalize_image(hr_scale0.clone()) if hr_scale0 is not None else None
     scale0_oracle_denorm = denormalize_image(hr_scale0_oracle.clone()) if hr_scale0_oracle is not None else None
+    stage3_scale0_denorm = denormalize_image(hr_stage3_scale0.clone()) if hr_stage3_scale0 is not None else None
 
     target_hw = gt_denorm.shape[-2:]
     lr_up = _resize_to(lr_denorm, target_hw)
@@ -124,9 +127,13 @@ def save_diagnostic_comparison(
         scale0_denorm = _resize_to(scale0_denorm, target_hw)
     if scale0_oracle_denorm is not None:
         scale0_oracle_denorm = _resize_to(scale0_oracle_denorm, target_hw)
+    if stage3_scale0_denorm is not None:
+        stage3_scale0_denorm = _resize_to(stage3_scale0_denorm, target_hw)
 
     num_samples = min(gt_denorm.shape[0], max_samples)
     has_scale0_oracle = scale0_oracle_denorm is not None
+    has_stage3_scale0 = stage3_scale0_denorm is not None
+    nrow = 5 + int(has_scale0_oracle) + int(has_stage3_scale0)
     tiles: List[torch.Tensor] = []
     for i in range(num_samples):
         row = [
@@ -136,6 +143,8 @@ def save_diagnostic_comparison(
         ]
         if has_scale0_oracle:
             row.append(scale0_oracle_denorm[i])
+        if has_stage3_scale0:
+            row.append(stage3_scale0_denorm[i])
         row.extend([
             oracle_denorm[i],
             gt_denorm[i],
@@ -144,11 +153,54 @@ def save_diagnostic_comparison(
 
     grid = torchvision.utils.make_grid(
         torch.stack(tiles, dim=0),
-        nrow=6 if has_scale0_oracle else 5,
+        nrow=nrow,
         padding=2,
         pad_value=1.0,
     )
     filepath = os.path.join(save_dir, f"ep{ep:04d}_it{it:06d}_diagnostic.png")
+    tensor_to_pil_image(grid).save(filepath)
+    return filepath
+
+
+def save_multiscale_diagnostic_comparison(
+    lr: torch.Tensor,
+    hr_by_scale: List[torch.Tensor],
+    hr_gt: torch.Tensor,
+    save_dir: str,
+    ep: int,
+    it: int,
+    max_samples: int = 4,
+) -> Optional[str]:
+    """Save a variable-width grid: `LR_upsampled | s0 | s1 | ... | HR_gt`."""
+    if not hr_by_scale:
+        return None
+    os.makedirs(save_dir, exist_ok=True)
+
+    lr_denorm = denormalize_image(lr.clone())
+    gt_denorm = denormalize_image(hr_gt.clone())
+    target_hw = gt_denorm.shape[-2:]
+    lr_up = _resize_to(lr_denorm, target_hw)
+    scale_imgs = [
+        _resize_to(denormalize_image(img.clone()), target_hw)
+        for img in hr_by_scale
+    ]
+
+    num_samples = min(gt_denorm.shape[0], max_samples)
+    tiles: List[torch.Tensor] = []
+    for i in range(num_samples):
+        tiles.append(lr_up[i])
+        for img in scale_imgs:
+            tiles.append(img[i])
+        tiles.append(gt_denorm[i])
+
+    nrow = 2 + len(scale_imgs)
+    grid = torchvision.utils.make_grid(
+        torch.stack(tiles, dim=0),
+        nrow=nrow,
+        padding=2,
+        pad_value=1.0,
+    )
+    filepath = os.path.join(save_dir, f"ep{ep:04d}_it{it:06d}_multiscale.png")
     tensor_to_pil_image(grid).save(filepath)
     return filepath
 
@@ -169,7 +221,8 @@ def save_reconstruction_run_metadata(
         "filename_pattern": filename_pattern,
         "frequency_description": frequency_description,
         "comparison_layout": "3 columns per row: LR_upsampled | HR_pred | HR_gt",
-        "diagnostic_layout": "6 columns per row when enabled: LR_upsampled | AR_full | AR_scale0_only | target_scale0_only | VAE_oracle | HR_gt",
+        "diagnostic_layout": "5-7 columns per row: LR_upsampled | AR_full | AR_scale0_only | target_scale0_only(optional) | stage3_scale0(optional) | VAE_oracle | HR_gt",
+        "multiscale_diagnostic_layout": "variable columns per row: LR_upsampled | s0 | s1 | ... | HR_gt",
         "max_samples_per_image": int(max_samples),
         "postprocess": [
             "denormalize LR/HR_pred/HR_gt from [-1, 1] to [0, 1]",

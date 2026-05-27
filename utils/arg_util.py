@@ -46,6 +46,10 @@ class Args(Tap):
     lr_cond_source: str = 'srvar_encoder'  # 'srvar_encoder' or 'lr_vae'
     stage1_ckpt: str = ''               # non-empty -> build & load LR_VAE
     skip_scale0_loss: bool = False      # plan-A only: drop scale[0] from DiffLoss target/z
+    scale0_start_source: str = 'transformer'  # 'transformer' or 'stage3'
+    stage3_ckpt: str = ''                # frozen myvaex stage3 LR->scale0 ckpt
+    stage3_context_mode: str = 'both'    # 'both' or 'prefix_only'
+    stage3_latent_size: int = 4          # n for the stage3 n*n s0 latent
     same_shape: bool = False            # if True, LR is bicubic-resized to HR size (legacy)
     # DiffLoss head
     diffloss_w: int = 1024
@@ -72,6 +76,7 @@ class Args(Tap):
     diagnostics_dir_name: str = 'diagnostics'
     diagnostics_max_samples: int = 4
     diagnostics_sample_scale0: bool = True
+    diagnostics_multiscale: bool = True
     # VAR
     # depth: int = 16     # VAR depth
     # ini: float = -1     # -1: automated model parameter initialization

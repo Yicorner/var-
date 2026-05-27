@@ -21,7 +21,7 @@ from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 import math
-from models import SRVAR, VQVAE, build_vae_srvar
+from models import SRVAR, Stage3Scale0Encoder, VQVAE, build_vae_srvar
 from torchvision.transforms import transforms
 import pyiqa
 from skimage import io
@@ -93,6 +93,61 @@ def rgb2ycbcr_pt(img, y_only=False):
 
 def get_value(x):
     return x.item() if isinstance(x, torch.Tensor) else x
+
+
+def _extract_stage3_state(ckpt: dict):
+    trainer = ckpt.get('trainer', {}) if isinstance(ckpt, dict) else {}
+    if isinstance(trainer, dict) and isinstance(trainer.get('stage3_encoder'), dict):
+        return trainer['stage3_encoder']
+    if isinstance(trainer, dict) and isinstance(trainer.get('stage3_wo_ddp'), dict):
+        return trainer['stage3_wo_ddp']
+    for key in ('stage3_encoder', 'stage3_wo_ddp', 'state_dict'):
+        if isinstance(ckpt, dict) and isinstance(ckpt.get(key), dict):
+            return ckpt[key]
+    return None
+
+
+def _read_stage3_config(ckpt: dict, key: str, default):
+    trainer = ckpt.get('trainer', {}) if isinstance(ckpt, dict) else {}
+    config = trainer.get('config', {}) if isinstance(trainer, dict) else {}
+    if isinstance(config, dict) and key in config:
+        return config.get(key, default)
+    args_state = ckpt.get('args', {}) if isinstance(ckpt, dict) else {}
+    if isinstance(args_state, dict):
+        return args_state.get(key, default)
+    return default
+
+
+def _build_metric_stage3(args, srvar_ckpt: dict, patch_nums, cvae: int, ch: int):
+    if getattr(args, 'scale0_start_source', 'transformer') != 'stage3':
+        return None
+    state = _extract_stage3_state(srvar_ckpt)
+    stage3_source_ckpt = None
+    if state is None and getattr(args, 'stage3_ckpt', ''):
+        stage3_source_ckpt = torch.load(args.stage3_ckpt, map_location='cpu')
+        state = _extract_stage3_state(stage3_source_ckpt)
+    if state is None:
+        raise KeyError('scale0_start_source=stage3 but no stage3_encoder state or --stage3_ckpt was found.')
+    config_blob = stage3_source_ckpt if stage3_source_ckpt is not None else srvar_ckpt
+    latent_size = int(_read_stage3_config(config_blob, 'stage3_latent_size', getattr(args, 'stage3_latent_size', patch_nums[0])))
+    assert int(patch_nums[0]) == latent_size, (
+        f'patch_nums[0]={patch_nums[0]} != stage3_latent_size={latent_size}'
+    )
+    stage3 = Stage3Scale0Encoder(
+        z_channels=int(_read_stage3_config(config_blob, 'Cvae', cvae)),
+        ch=int(_read_stage3_config(config_blob, 'ch', ch)),
+        dropout=float(_read_stage3_config(config_blob, 'dropout', 0.0)),
+        quant_conv_ks=int(_read_stage3_config(config_blob, 'quant_conv_ks', 3)),
+        latent_size=latent_size,
+        img_channels=int(_read_stage3_config(config_blob, 'img_channels', getattr(args, 'img_channels', 3))),
+    ).to(args.device)
+    stage3.load_state_dict(state, strict=True)
+    stage3.eval()
+    for p in stage3.parameters():
+        p.requires_grad_(False)
+    return stage3
+
+
 def write_metrics_to_file(filename, metric_name, values, outCMD =False):
     mean_val = sum(values) / len(values)
     max_val = max(values)
@@ -146,6 +201,12 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
         diffloss_d=getattr(args, 'diffloss_d', 3),
         diff_steps=str(getattr(args, 'diff_steps', '100')),
         diffloss_batch_mul=getattr(args, 'diffloss_batch_mul', 4),
+        diffloss_sample_clip_denoised=getattr(args, 'diffloss_sample_clip_denoised', True),
+        continuous_head_type=getattr(args, 'continuous_head_type', 'diffloss'),
+        scale_loss_weighting=getattr(args, 'scale_loss_weighting', 'token'),
+        scale0_query_source=getattr(args, 'scale0_query_source', 'sos'),
+        scale0_start_source=getattr(args, 'scale0_start_source', 'transformer'),
+        stage3_context_mode=getattr(args, 'stage3_context_mode', 'both'),
         lr_cond_source=getattr(args, 'lr_cond_source', 'srvar_encoder'),
     )
     if args.dp >= 0:
@@ -163,6 +224,7 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
 
         srvar.eval()
         vae.eval()
+        stage3_encoder = _build_metric_stage3(args, ckpt, patch_nums, Cvae, ch)
 
         out_dir = os.path.join("metric_results", os.path.basename(ckpt_path_srvar))
         predict_dir = os.path.join(out_dir, "predict")
@@ -184,6 +246,8 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
             if ref_B3HW is not None:
                 ref_B3HW = ref_B3HW.to(dist.get_device(), non_blocking=True)
             B = inp_B3HW_low.shape[0]
+            with torch.no_grad():
+                stage3_s0 = stage3_encoder(inp_B3HW_low).contiguous() if stage3_encoder is not None else None
 
             h_div_w = inp_B3HW_low.shape[-2] / inp_B3HW_low.shape[-1]
             T = 1 if inp_B3HW_low.dim() == 4 else inp_B3HW_low.shape[2]
@@ -198,6 +262,7 @@ def get_img(args, ld_val, maxtot, ckpt_paths, beam_search_nums=None, choose_min=
                 vae=vae,
                 inp_B3HW_low=inp_B3HW_low,
                 ref_B3HW=ref_B3HW,
+                stage3_s0=stage3_s0,
                 scale_schedule=scale_schedule,
                 ret_img=True,
                 B=B,

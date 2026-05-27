@@ -44,6 +44,10 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `lr_cond_source` | `srvar_encoder` | `srvar_encoder` 或 `lr_vae` |
 | `stage1_ckpt` | `""` | 非空时构造 LR_VAE 并加载 |
 | `skip_scale0_loss` | False | 启用 stage1 时是否跳过 scale[0] 的 DiffLoss |
+| `scale0_start_source` | `transformer` | `transformer` keeps old scale0 prediction path; `stage3` uses frozen myvaex stage3 `s0_pred` |
+| `stage3_ckpt` | `""` | frozen myvaex stage3 LR->scale0 checkpoint |
+| `stage3_context_mode` | `both` | `both` uses `s0_pred` as self-attn prefix and cross-attn KV; `prefix_only` keeps old cross-attn |
+| `stage3_latent_size` | `4` | must equal `patch_nums[0]` and stage3 checkpoint latent size |
 | `tlen` | 1024 | `cfg_uncond` 长度，需 `≥ low_len` |
 
 ### 1.4 CFG
@@ -68,6 +72,7 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `diagnostics_interval` | 0 | 0 = 跟随 log iter；>0 = 每 N iter 诊断一次 |
 | `diagnostics_dir_name` | `diagnostics` | 诊断图输出子目录 |
 | `diagnostics_sample_scale0` | True | 是否额外只采样 scale[0] 并 decode |
+| `diagnostics_multiscale` | True | save `ep*_multiscale.png`: LR | s0 | s1 | ... | HR |
 
 ### 1.6 Resume / BED / auto_resume
 
@@ -217,6 +222,27 @@ state = {
 
 ---
 
+
+## Stage3 start diagnostics
+
+When `scale0_start_source=stage3`, the trainer computes `stage3_s0 = frozen_stage3(LR)`.
+Only the first teacher-forcing segment is replaced:
+
+```text
+input_for_s1 <- interpolate/accumulate from stage3_s0
+input_for_s2+ <- original HR teacher-forcing tensors
+```
+
+The scale0 loss mask is forced on in this mode, even if `skip_scale0_loss=False`.
+Diagnostics print `stage3_s0`, `target_s0`, `sample_s0`, and save:
+
+- `ep*_diagnostic.png`: includes optional stage3 scale0 decode.
+- `ep*_multiscale.png`: `LR | s0 | s1 | ... | HR`.
+
+Use `STAGE3_CONTEXT_MODE=both` by default. It removes the local SRVAR LR encoder
+from the graph and uses `stage3_s0` as cross-attn KV, avoiding DDP unused-parameter
+issues. Use `prefix_only` only when you intentionally want the old LR cross-attn
+path plus a stage3 self-attn prefix.
 
 ## 7. 排查顺序
 

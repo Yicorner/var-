@@ -44,6 +44,12 @@ STAGE1_CKPT=${STAGE1_CKPT:-${stage1_ckpt:-""}}
 LR_COND_SOURCE=${LR_COND_SOURCE:-${lr_cond_source:-srvar_encoder}}
 SKIP_SCALE0_LOSS=${SKIP_SCALE0_LOSS:-${skip_scale0_loss:-False}}
 
+# -------- Stage3 LR -> scale0 start (optional) --------
+SCALE0_START_SOURCE=${SCALE0_START_SOURCE:-${scale0_start_source:-transformer}}
+STAGE3_CKPT=${STAGE3_CKPT:-${stage3_ckpt:-""}}
+STAGE3_CONTEXT_MODE=${STAGE3_CONTEXT_MODE:-${stage3_context_mode:-both}}
+STAGE3_LATENT_SIZE=${STAGE3_LATENT_SIZE:-${stage3_latent_size:-4}}
+
 # -------- training --------
 EP=${EP:-${ep:-50}}
 BS=${BS:-${bs:-4}}
@@ -83,6 +89,7 @@ DIAGNOSTICS_INTERVAL=${DIAGNOSTICS_INTERVAL:-${diagnostics_interval:-0}}
 DIAGNOSTICS_DIR_NAME=${DIAGNOSTICS_DIR_NAME:-${diagnostics_dir_name:-diagnostics}}
 DIAGNOSTICS_MAX_SAMPLES=${DIAGNOSTICS_MAX_SAMPLES:-${diagnostics_max_samples:-4}}
 DIAGNOSTICS_SAMPLE_SCALE0=${DIAGNOSTICS_SAMPLE_SCALE0:-${diagnostics_sample_scale0:-True}}
+DIAGNOSTICS_MULTISCALE=${DIAGNOSTICS_MULTISCALE:-${diagnostics_multiscale:-True}}
 AUTO_RESUME=${AUTO_RESUME:-${auto_resume:-True}}
 RESUME=${RESUME:-${resume:-""}}
 
@@ -112,6 +119,10 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --vae_ckpt="$VAE_CKPT" \
   --Ct5="$CVAE" --vae_ch="$VAE_CH" \
   --quant_resi="$QUANT_RESI" --share_quant_resi="$SHARE_QUANT_RESI" \
+  --scale0_start_source="$SCALE0_START_SOURCE" \
+  --stage3_ckpt="$STAGE3_CKPT" \
+  --stage3_context_mode="$STAGE3_CONTEXT_MODE" \
+  --stage3_latent_size="$STAGE3_LATENT_SIZE" \
   --tlen="$TLEN" \
   --pn="1M" --rope2d_normalized_by_hw=2 --rope2d_each_sa_layer=1 \
   --enable_checkpointing="full-block" \
@@ -136,6 +147,7 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --diagnostics_dir_name="$DIAGNOSTICS_DIR_NAME" \
   --diagnostics_max_samples="$DIAGNOSTICS_MAX_SAMPLES" \
   --diagnostics_sample_scale0="$DIAGNOSTICS_SAMPLE_SCALE0" \
+  --diagnostics_multiscale="$DIAGNOSTICS_MULTISCALE" \
   --auto_resume="$AUTO_RESUME" \
   --resume="$RESUME" \
   --use_ref=False \

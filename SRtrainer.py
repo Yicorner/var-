@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import dist
-from models import SRVAR, VQVAE
+from models import SRVAR, Stage3Scale0Encoder, VQVAE
 from utils.amp_sc import AmpOptimizer
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 from utils.misc import MetricLogger, TensorboardLogger
@@ -70,8 +70,11 @@ class SRVARTrainer(object):
         label_smooth: float = 0.0,                  # kept for ckpt compat, unused (no CE)
         use_are_loss_weight: bool = False,          # kept for ckpt compat, unused
         lr_vae=None,                                # frozen LR_VAE (optional, plan-A)
+        stage3_encoder: Optional[Stage3Scale0Encoder] = None,
         lr_cond_source: str = 'srvar_encoder',
         skip_scale0_loss: bool = False,
+        scale0_start_source: str = 'transformer',
+        stage3_context_mode: str = 'both',
         diffloss_batch_mul: int = 4,
         args=None,                                  # full args (for reconstruction metadata)
     ):
@@ -81,10 +84,22 @@ class SRVARTrainer(object):
         self.srvar_wo_ddp: SRVAR = srvar_wo_ddp
         self.var_opt = var_opt
         self.lr_vae = lr_vae
+        self.stage3_encoder = stage3_encoder
         self.lr_cond_source = lr_cond_source
+        self.scale0_start_source = scale0_start_source
+        self.stage3_context_mode = stage3_context_mode
         self.skip_scale0_loss = skip_scale0_loss
         self.diffloss_batch_mul = int(diffloss_batch_mul)
         self.args = args
+
+        assert self.scale0_start_source in ('transformer', 'stage3')
+        assert self.stage3_context_mode in ('both', 'prefix_only')
+        if self.scale0_start_source == 'stage3':
+            assert self.stage3_encoder is not None, 'scale0_start_source=stage3 requires stage3_encoder.'
+        if self.stage3_encoder is not None:
+            self.stage3_encoder.eval()
+            for p in self.stage3_encoder.parameters():
+                p.requires_grad_(False)
 
         del self.srvar_wo_ddp.rng
         self.srvar_wo_ddp.rng = torch.Generator(device=device)
@@ -112,6 +127,63 @@ class SRVARTrainer(object):
         with torch.no_grad():
             ms_h_target, ms_x_input, f_hat_full = self.vae_local.img_to_ms_continuous_input(inp_B3HW_super)
         return ms_h_target, ms_x_input, f_hat_full
+
+    def _uses_stage3_start(self) -> bool:
+        return self.scale0_start_source == 'stage3'
+
+    @torch.no_grad()
+    def _stage3_s0(self, inp_B3HW_low: Ten) -> Optional[Ten]:
+        """Frozen myvaex stage3 LR -> scale[0] posterior mean."""
+        if not self._uses_stage3_start():
+            return None
+        assert self.stage3_encoder is not None
+        was_training = self.stage3_encoder.training
+        self.stage3_encoder.eval()
+        try:
+            return self.stage3_encoder(inp_B3HW_low).contiguous()
+        finally:
+            self.stage3_encoder.train(was_training)
+
+    @torch.no_grad()
+    def _replace_s1_input_with_stage3_s0(
+        self,
+        ms_x_input: Optional[Ten],
+        stage3_s0: Optional[Ten],
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> Optional[Ten]:
+        """Use stage3 s0 only for the first teacher-forcing transition.
+
+        `ms_x_input` layout is `[input_for_s1, input_for_s2, ...]`; this method
+        replaces only the first segment. Inputs for s2+ remain HR teacher-forced.
+        """
+        if stage3_s0 is None:
+            return ms_x_input
+        if len(scale_schedule) <= 1:
+            assert ms_x_input is None, 'single-scale schedule should not have ms_x_input.'
+            return None
+        assert ms_x_input is not None, 'stage3 schedule with s1+ requires ms_x_input.'
+        pn_t, pn_h, pn_w = scale_schedule[0]
+        assert pn_t == 1 and stage3_s0.shape[-2:] == (pn_h, pn_w), (
+            f'stage3_s0 {tuple(stage3_s0.shape)} incompatible with scale[0]={scale_schedule[0]}'
+        )
+        next_t, next_h, next_w = scale_schedule[1]
+        assert next_t == 1, f'stage3 s1 input replacement expects image scale[1], got {scale_schedule[1]}'
+
+        B, C, _, _ = stage3_s0.shape
+        final_pn = int(self.patch_nums[-1])
+        accu = stage3_s0.new_zeros(B, C, final_pn, final_pn)
+        _, s1_fhat = self.vae_local.quantize.get_next_autoregressive_input(
+            0, len(self.patch_nums), accu, stage3_s0,
+        )
+        s1_tokens = s1_fhat.reshape(B, C, -1).transpose(1, 2).contiguous()
+        first_next_l = int(next_t * next_h * next_w)
+        assert s1_tokens.shape[1] == first_next_l, (
+            f'stage3-derived s1 tokens {s1_tokens.shape[1]} != expected {first_next_l}'
+        )
+        assert ms_x_input.shape[1] >= first_next_l, (
+            f'ms_x_input length {ms_x_input.shape[1]} shorter than s1 segment {first_next_l}'
+        )
+        return torch.cat([s1_tokens, ms_x_input[:, first_next_l:]], dim=1)
 
     @staticmethod
     def _tensor_stats(name: str, tensor: Optional[Ten]) -> str:
@@ -165,7 +237,8 @@ class SRVARTrainer(object):
                 f'LR_VAE latent {tuple(lr_mean.shape)} != scale[0] target '
                 f'{tuple(ms_h_target[0].shape)}; check patch_nums[0] vs lr_img_size/16'
             )
-            ms_h_target[0] = lr_mean.contiguous()
+            if not self._uses_stage3_start():
+                ms_h_target[0] = lr_mean.contiguous()
             if self.lr_cond_source == 'lr_vae':
                 low_f_override = lr_mean.reshape(B, C, -1).transpose(1, 2).contiguous()  # [B, h*w, C]
         return ms_h_target, low_f_override
@@ -207,6 +280,14 @@ class SRVARTrainer(object):
             ms_h_target, ms_x_input, _ = self._build_targets(inp_B3HW_super)
             ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
             scale_schedule = self._get_scale_schedule(inp_B3HW_low)
+            stage3_s0 = self._stage3_s0(inp_B3HW_low)
+            if stage3_s0 is not None:
+                assert stage3_s0.shape == ms_h_target[0].shape, (
+                    f'stage3_s0 {tuple(stage3_s0.shape)} != target_s0 {tuple(ms_h_target[0].shape)}'
+                )
+                ms_x_input = self._replace_s1_input_with_stage3_s0(
+                    ms_x_input, stage3_s0, scale_schedule
+                )
 
             loss = self.srvar(
                 inp_B3HW_low=inp_B3HW_low,
@@ -215,8 +296,9 @@ class SRVARTrainer(object):
                 scale_schedule=scale_schedule,
                 ref_B3HW=ref_B3HW,
                 low_f_override=low_f_override,
+                stage3_s0=stage3_s0,
                 cfg_infer=True,
-                scale0_loss_mask=self.skip_scale0_loss,
+                scale0_loss_mask=self.skip_scale0_loss or self._uses_stage3_start(),
             )
             diff_loss_sum += float(loss.item()) * B
             tot += B
@@ -227,6 +309,7 @@ class SRVARTrainer(object):
                     from utils.image_saver import compute_psnr_ssim
                     rec_img = self._quick_reconstruction(
                         inp_B3HW_low, scale_schedule, ref_B3HW, low_f_override,
+                        stage3_s0=stage3_s0,
                         cfg=cfg_infer_scale, temperature=temperature,
                     )
                     metrics = compute_psnr_ssim(rec_img, inp_B3HW_super)
@@ -260,6 +343,7 @@ class SRVARTrainer(object):
         scale_schedule: List[Tuple[int, int, int]],
         ref_B3HW: Optional[Ten],
         low_f_override: Optional[Ten],
+        stage3_s0: Optional[Ten] = None,
         cfg: float = 1.0,
         temperature: float = 1.0,
         trunk_scale: int = 1000,
@@ -274,6 +358,7 @@ class SRVARTrainer(object):
                 inp_B3HW_low=inp_B3HW_low,
                 ref_B3HW=ref_B3HW,
                 low_f_override=low_f_override,
+                stage3_s0=stage3_s0,
                 B=inp_B3HW_low.shape[0],
                 return_fhat=True,
                 cfg=cfg,
@@ -298,18 +383,36 @@ class SRVARTrainer(object):
         return self.vae_local.fhat_to_img(accu)
 
     @torch.no_grad()
+    def _decode_tokens_by_scale(self, tokens: List[Ten]) -> List[Ten]:
+        """Decode cumulative AR reconstructions after each sampled scale."""
+        if not tokens:
+            return []
+        B, C, _, _ = tokens[0].shape
+        final_pn = int(self.patch_nums[-1])
+        accu = tokens[0].new_zeros(B, C, final_pn, final_pn)
+        recs: List[Ten] = []
+        for si, h in enumerate(tokens):
+            accu, _ = self.vae_local.quantize.get_next_autoregressive_input(
+                si, len(self.patch_nums), accu, h,
+            )
+            recs.append(self.vae_local.fhat_to_img(accu.clone()))
+        return recs
+
+    @torch.no_grad()
     def _quick_reconstruction(
         self,
         inp_B3HW_low: Ten,
         scale_schedule: List[Tuple[int, int, int]],
         ref_B3HW: Optional[Ten],
         low_f_override: Optional[Ten],
+        stage3_s0: Optional[Ten] = None,
         cfg: float = 1.0,
         temperature: float = 1.0,
     ) -> Ten:
         """Run AR sampling and return reconstructed HR `[B, img_channels, H, W]` in [-1, 1]."""
         rec, _, _ = self._sample_ar(
             inp_B3HW_low, scale_schedule, ref_B3HW, low_f_override,
+            stage3_s0=stage3_s0,
             cfg=cfg, temperature=temperature,
         )
         return rec
@@ -351,6 +454,14 @@ class SRVARTrainer(object):
         ms_h_target, ms_x_input, f_hat_full = self._build_targets(inp_B3HW_super)
         ms_h_target, low_f_override = self._maybe_lr_vae_override(inp_B3HW_low, ms_h_target)
         scale_schedule = self._get_scale_schedule(inp_B3HW_low)
+        stage3_s0 = self._stage3_s0(inp_B3HW_low)
+        if stage3_s0 is not None:
+            assert stage3_s0.shape == ms_h_target[0].shape, (
+                f'stage3_s0 {tuple(stage3_s0.shape)} != target_s0 {tuple(ms_h_target[0].shape)}'
+            )
+            ms_x_input = self._replace_s1_input_with_stage3_s0(
+                ms_x_input, stage3_s0, scale_schedule
+            )
 
         with self.var_opt.amp_ctx:
             loss = self.srvar(
@@ -360,8 +471,9 @@ class SRVARTrainer(object):
                 scale_schedule=scale_schedule,
                 ref_B3HW=ref_B3HW,
                 low_f_override=low_f_override,
+                stage3_s0=stage3_s0,
                 cfg_infer=False,
-                scale0_loss_mask=self.skip_scale0_loss,
+                scale0_loss_mask=self.skip_scale0_loss or self._uses_stage3_start(),
             )
 
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(
@@ -393,7 +505,7 @@ class SRVARTrainer(object):
                 try:
                     self._maybe_save_reconstruction(
                         ep, it, inp_B3HW_low, inp_B3HW_super, ref_B3HW,
-                        low_f_override, scale_schedule, f_hat_full, ms_h_target,
+                        low_f_override, stage3_s0, scale_schedule, f_hat_full, ms_h_target,
                         save_reconstruction=bool(getattr(self.args, 'save_reconstruction_images', True) and recon_event),
                         save_diagnostics=bool(diag_event),
                     )
@@ -429,6 +541,7 @@ class SRVARTrainer(object):
         inp_B3HW_super: Ten,
         ref_B3HW: Optional[Ten],
         low_f_override: Optional[Ten],
+        stage3_s0: Optional[Ten],
         scale_schedule: List[Tuple[int, int, int]],
         f_hat_full: Ten,
         ms_h_target: List[Ten],
@@ -441,6 +554,7 @@ class SRVARTrainer(object):
         from utils.image_saver import save_reconstruction_comparison
         from utils.image_saver import save_reconstruction_run_metadata
         from utils.image_saver import save_diagnostic_comparison
+        from utils.image_saver import save_multiscale_diagnostic_comparison
         from utils.image_saver import compute_psnr_ssim
 
         args = self.args
@@ -456,6 +570,7 @@ class SRVARTrainer(object):
                 inp_B3HW_low[:max_B], scale_schedule,
                 ref_B3HW[:max_B] if ref_B3HW is not None else None,
                 low_f_override[:max_B] if low_f_override is not None else None,
+                stage3_s0=stage3_s0[:max_B] if stage3_s0 is not None else None,
             )
             oracle = self.vae_local.fhat_to_img(f_hat_full[:max_B])
 
@@ -483,14 +598,20 @@ class SRVARTrainer(object):
                     inp_B3HW_low[:max_B], scale_schedule,
                     ref_B3HW[:max_B] if ref_B3HW is not None else None,
                     low_f_override[:max_B] if low_f_override is not None else None,
+                    stage3_s0=stage3_s0[:max_B] if stage3_s0 is not None else None,
                     trunk_scale=1,
                 )
                 target_scale0_oracle = self._decode_target_scale0_only(ms_h_target[0][:max_B])
+            stage3_scale0_oracle = (
+                self._decode_target_scale0_only(stage3_s0[:max_B])
+                if stage3_s0 is not None else None
+            )
             save_diagnostic_comparison(
                 lr=inp_B3HW_low[:max_B],
                 hr_ar=rec,
                 hr_scale0=rec_scale0,
                 hr_scale0_oracle=target_scale0_oracle,
+                hr_stage3_scale0=stage3_scale0_oracle,
                 hr_oracle=oracle,
                 hr_gt=inp_B3HW_super[:max_B],
                 save_dir=diag_dir,
@@ -498,11 +619,23 @@ class SRVARTrainer(object):
                 it=it,
                 max_samples=int(getattr(args, 'diagnostics_max_samples', max_samples)),
             )
+            if getattr(args, 'diagnostics_multiscale', True):
+                multiscale_recs = self._decode_tokens_by_scale(sampled_tokens)
+                save_multiscale_diagnostic_comparison(
+                    lr=inp_B3HW_low[:max_B],
+                    hr_by_scale=multiscale_recs,
+                    hr_gt=inp_B3HW_super[:max_B],
+                    save_dir=diag_dir,
+                    ep=ep,
+                    it=it,
+                    max_samples=int(getattr(args, 'diagnostics_max_samples', max_samples)),
+                )
 
             ar_metrics = compute_psnr_ssim(rec, inp_B3HW_super[:max_B])
             oracle_metrics = compute_psnr_ssim(oracle, inp_B3HW_super[:max_B])
             scale0_metrics = compute_psnr_ssim(rec_scale0, inp_B3HW_super[:max_B]) if rec_scale0 is not None else None
             target_scale0_metrics = compute_psnr_ssim(target_scale0_oracle, inp_B3HW_super[:max_B]) if target_scale0_oracle is not None else None
+            stage3_scale0_metrics = compute_psnr_ssim(stage3_scale0_oracle, inp_B3HW_super[:max_B]) if stage3_scale0_oracle is not None else None
             print(
                 f'[diagnostics ep={ep} it={it}] '
                 f'AR_PSNR={ar_metrics["psnr_mean"]:.2f} AR_SSIM={ar_metrics["ssim_mean"]:.4f} | '
@@ -515,9 +648,14 @@ class SRVARTrainer(object):
                     f' | TARGET_SCALE0_PSNR={target_scale0_metrics["psnr_mean"]:.2f} TARGET_SCALE0_SSIM={target_scale0_metrics["ssim_mean"]:.4f}'
                     if target_scale0_metrics is not None else ''
                 )
+                + (
+                    f' | STAGE3_SCALE0_PSNR={stage3_scale0_metrics["psnr_mean"]:.2f} STAGE3_SCALE0_SSIM={stage3_scale0_metrics["ssim_mean"]:.4f}'
+                    if stage3_scale0_metrics is not None else ''
+                )
             )
             print('[diagnostics latent] ' + ' | '.join([
                 self._tensor_stats('lr', inp_B3HW_low[:max_B]),
+                self._tensor_stats('stage3_s0', stage3_s0[:max_B] if stage3_s0 is not None else None),
                 self._tensor_stats('target_s0', ms_h_target[0][:max_B]),
                 self._tensor_stats('target_last', ms_h_target[-1][:max_B]),
                 self._tensor_stats('sample_s0', sampled_tokens[0] if sampled_tokens else None),
@@ -548,6 +686,8 @@ class SRVARTrainer(object):
             'first_prog': self.first_prog,
             'lr_cond_source': self.lr_cond_source,
             'skip_scale0_loss': self.skip_scale0_loss,
+            'scale0_start_source': self.scale0_start_source,
+            'stage3_context_mode': self.stage3_context_mode,
             'diffloss_batch_mul': self.diffloss_batch_mul,
             'scale0_query_source': getattr(self.srvar_wo_ddp, 'scale0_query_source', 'sos'),
             'scale_loss_weighting': getattr(self.srvar_wo_ddp, 'scale_loss_weighting', 'token'),
@@ -563,6 +703,8 @@ class SRVARTrainer(object):
                 state[k] = m.state_dict()
         if self.lr_vae is not None:
             state['lr_vae'] = self.lr_vae.state_dict()
+        if self.stage3_encoder is not None:
+            state['stage3_encoder'] = self.stage3_encoder.state_dict()
         return state
 
     def load_state_dict(self, state, strict=True, skip_vae=False):
@@ -582,6 +724,8 @@ class SRVARTrainer(object):
 
         if self.lr_vae is not None and 'lr_vae' in state:
             self.lr_vae.load_state_dict(state['lr_vae'], strict=strict)
+        if self.stage3_encoder is not None and 'stage3_encoder' in state:
+            self.stage3_encoder.load_state_dict(state['stage3_encoder'], strict=strict)
 
         config: dict = state.pop('config', None)
         if config is not None:

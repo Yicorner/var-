@@ -20,7 +20,7 @@ from utils.misc import auto_resume
 import math
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from models import SRVAR, VQVAE, build_vae_srvar, build_lr_vae, LR_VAE
+from models import SRVAR, Stage3Scale0Encoder, VQVAE, build_vae_srvar, build_lr_vae, LR_VAE
 from SRtrainer import SRVARTrainer
 from utils.amp_sc import AmpOptimizer
 from utils.lr_control import filter_params
@@ -33,6 +33,65 @@ def _read_ckpt_arg(ckpt: dict, key: str, default):
     if isinstance(args_state, dict):
         return args_state.get(key, default)
     return default
+
+
+def _read_stage3_ckpt_config(ckpt: dict, key: str, default):
+    trainer = ckpt.get('trainer', {}) if isinstance(ckpt, dict) else {}
+    config = trainer.get('config', {}) if isinstance(trainer, dict) else {}
+    if isinstance(config, dict) and key in config:
+        return config.get(key, default)
+    return _read_ckpt_arg(ckpt, key, default)
+
+
+def _extract_stage3_state(ckpt: dict) -> dict:
+    trainer = ckpt.get('trainer', {}) if isinstance(ckpt, dict) else {}
+    if isinstance(trainer, dict) and isinstance(trainer.get('stage3_wo_ddp'), dict):
+        return trainer['stage3_wo_ddp']
+    for key in ('stage3_wo_ddp', 'state_dict'):
+        if isinstance(ckpt, dict) and isinstance(ckpt.get(key), dict):
+            return ckpt[key]
+    raise KeyError('Could not locate stage3 weights in checkpoint.')
+
+
+def _build_stage3_encoder(args: arg_util.Args, vae_local: VQVAE) -> Optional[Stage3Scale0Encoder]:
+    if args.scale0_start_source != 'stage3':
+        return None
+    assert args.stage3_ckpt, '--stage3_ckpt is required when --scale0_start_source=stage3.'
+    ckpt = torch.load(args.stage3_ckpt, map_location='cpu')
+    latent_size = int(_read_stage3_ckpt_config(ckpt, 'stage3_latent_size', args.stage3_latent_size))
+    assert latent_size == int(args.stage3_latent_size), (
+        f'stage3 ckpt latent_size={latent_size} != --stage3_latent_size={args.stage3_latent_size}'
+    )
+    assert int(vae_local.quantize.v_patch_nums[0]) == latent_size, (
+        f'vae scale[0]={vae_local.quantize.v_patch_nums[0]} != stage3 latent_size={latent_size}; '
+        f'check --patch_nums and --stage3_latent_size.'
+    )
+
+    cvae = int(_read_stage3_ckpt_config(ckpt, 'Cvae', _read_stage3_ckpt_config(ckpt, 'vocab_width', args.Ct5)))
+    ch = int(_read_stage3_ckpt_config(ckpt, 'ch', args.vae_ch))
+    img_channels = int(_read_stage3_ckpt_config(ckpt, 'img_channels', args.img_channels))
+    quant_conv_ks = int(_read_stage3_ckpt_config(ckpt, 'quant_conv_ks', getattr(vae_local, 'quant_conv_ks', 3)))
+    dropout = float(_read_stage3_ckpt_config(ckpt, 'dropout', getattr(vae_local, 'dropout', 0.0)))
+
+    assert cvae == int(vae_local.Cvae), f'stage3 Cvae={cvae} != VAE Cvae={vae_local.Cvae}'
+    assert img_channels == int(args.img_channels), (
+        f'stage3 img_channels={img_channels} != args.img_channels={args.img_channels}'
+    )
+
+    stage3 = Stage3Scale0Encoder(
+        z_channels=cvae,
+        ch=ch,
+        dropout=dropout,
+        quant_conv_ks=quant_conv_ks,
+        latent_size=latent_size,
+        img_channels=img_channels,
+    ).to(dist.get_device())
+    stage3.load_state_dict(_extract_stage3_state(ckpt), strict=True)
+    stage3.eval()
+    for p in stage3.parameters():
+        p.requires_grad_(False)
+    print(f'[stage3_ckpt] loaded frozen Stage3Scale0Encoder from {args.stage3_ckpt}')
+    return stage3
 
 def build_everything(args: arg_util.Args):
     # resume: --resume takes precedence; else fall back to latest ckpt under BED when auto_resume=True
@@ -55,6 +114,13 @@ def build_everything(args: arg_util.Args):
     print(f'initial args:\n{str(args)}')
 
     assert args.vae_ckpt, '--vae_ckpt must be provided (myvaex stage2 ckpt path).'
+    assert args.scale0_start_source in ('transformer', 'stage3'), \
+        f"--scale0_start_source must be 'transformer' or 'stage3', got {args.scale0_start_source!r}"
+    assert args.stage3_context_mode in ('both', 'prefix_only'), \
+        f"--stage3_context_mode must be 'both' or 'prefix_only', got {args.stage3_context_mode!r}"
+    args.stage3_latent_size = int(args.stage3_latent_size)
+    if args.scale0_start_source == 'stage3':
+        assert args.stage3_ckpt, '--stage3_ckpt is required when --scale0_start_source=stage3.'
     vae_ckpt_blob = torch.load(args.vae_ckpt, map_location='cpu')
     ckpt_img_channels = int(_read_ckpt_arg(vae_ckpt_blob, 'img_channels', args.img_channels))
     if ckpt_img_channels != int(args.img_channels):
@@ -140,6 +206,8 @@ def build_everything(args: arg_util.Args):
     assert tuple(vae_local.quantize.v_patch_nums) == tuple(args.patch_nums), (
         f'patch_nums mismatch: ckpt={vae_local.quantize.v_patch_nums} vs args={args.patch_nums}'
     )
+
+    stage3_encoder = _build_stage3_encoder(args, vae_local)
 
     # Optional stage1 LR_VAE.
     lr_vae_local: Optional[LR_VAE] = None
@@ -233,15 +301,18 @@ def build_everything(args: arg_util.Args):
         var_opt=srvar_optim, label_smooth=args.ls,
         use_are_loss_weight=args.use_are_loss_weight,
         lr_vae=lr_vae_local,
+        stage3_encoder=stage3_encoder,
         lr_cond_source=args.lr_cond_source,
         skip_scale0_loss=args.skip_scale0_loss,
+        scale0_start_source=args.scale0_start_source,
+        stage3_context_mode=args.stage3_context_mode,
         diffloss_batch_mul=args.diffloss_batch_mul,
         args=args,
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True)
 
-    del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim, lr_vae_local
+    del vae_local, srvar_wo_ddp, srvar_ddp, srvar_optim, lr_vae_local, stage3_encoder
     
     dist.barrier()
     return (

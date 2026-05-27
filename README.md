@@ -367,3 +367,61 @@ DIAGNOSTICS_INTERVAL=500 \
 DIAGNOSTICS_SAMPLE_SCALE0=True \
 bash SRtrain.sh
 ```
+## Stage3 Scale0 Start Mode
+
+Default SRVAR behavior stays unchanged with
+`SCALE0_START_SOURCE=transformer`. To use a frozen myvaex stage3 LR encoder as
+the autoregressive starting point, enable `SCALE0_START_SOURCE=stage3`.
+
+Training flow in this mode:
+
+```text
+s0_pred = frozen_stage3(LR)
+s0_pred is used as the scale[0] self-attn prefix and, in mode=both, cross-attn KV
+scale[0] target remains available for diagnostics but its loss mask is zero
+s1 input is interpolated from s0_pred
+s2+ inputs remain HR teacher-forcing inputs from the stage2 VAE targets
+```
+
+Recommended training command:
+
+```bash
+EXP_NAME=srvar_stage3_s0_start \
+DATA_PATH=/path/to/paired_dataset \
+VAE_CKPT=/path/to/myvaex_stage2/ckpt-best.pth \
+STAGE3_CKPT=/path/to/myvaex_stage3/ckpt-best.pth \
+SCALE0_START_SOURCE=stage3 \
+STAGE3_CONTEXT_MODE=both \
+STAGE3_LATENT_SIZE=4 \
+PATCH_NUMS_STR="4 5 6 8 10 13 16" \
+LR_FOLDER=LR_64x64 \
+HR_FOLDER=HR \
+CONTINUOUS_HEAD_TYPE=mse \
+DIAGNOSTICS_ENABLED=True \
+DIAGNOSTICS_MULTISCALE=True \
+bash SRtrain.sh
+```
+
+Useful switches:
+
+- `STAGE3_CONTEXT_MODE=both`: use `s0_pred` as both self-attn prefix and cross-attn KV.
+- `STAGE3_CONTEXT_MODE=prefix_only`: use `s0_pred` only as the self-attn prefix; cross-attn keeps the old LR condition path.
+- `SCALE0_START_SOURCE=transformer`: old path, transformer predicts scale[0] and scale[0] can participate in loss.
+- In stage3 mode, SRVAR automatically masks scale[0] loss.
+
+Inference / metric:
+
+```bash
+python metric.py \
+  --ckpt local_output/srvar_stage3_s0_start/ar-ckpt-best.pth \
+  --data_path /path/to/paired_dataset/val \
+  --scale0_start_source stage3 \
+  --stage3_ckpt /path/to/myvaex_stage3/ckpt-best.pth \
+  --stage3_context_mode both \
+  --stage3_latent_size 4 \
+  --cfg_infer 1.0 \
+  --diff_steps 100
+```
+
+Diagnostics now include `stage3_s0` latent stats, optional stage3 scale0 decode,
+and `epXXXX_itYYYYYY_multiscale.png` under `{BED}/{DIAGNOSTICS_DIR_NAME}/`.

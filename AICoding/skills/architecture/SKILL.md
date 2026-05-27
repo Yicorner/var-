@@ -61,6 +61,35 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
 
 ---
 
+## Stage3 scale0 start mode
+
+When `scale0_start_source='stage3'`, scale[0] is no longer predicted by the
+transformer:
+
+```text
+stage3_s0 = frozen Stage3Scale0Encoder(LR)          # [B, Cvae, n, n]
+assert stage3_s0.shape == ms_h_target[0].shape
+
+x_BLC first segment = word_embed(norm(stage3_s0 tokens)) + pos_start
+loss mask for scale[0] = 0
+ms_x_input segment for s1 = VAE accumulate/interpolate from stage3_s0
+ms_x_input segments for s2+ = unchanged HR teacher forcing
+```
+
+`stage3_context_mode='both'` also uses flattened `stage3_s0` as cross-attn KV,
+so the local SRVAR LR encoder is not built. `prefix_only` keeps the old LR
+cross-attn path and uses stage3 only for the self-attn prefix.
+
+Inference mirrors training:
+
+```text
+ret[0] = stage3_s0
+warm self-attn KV cache with the stage3 s0 prefix
+ignore transformer output for scale[0]
+accumulate stage3_s0 through vae.quantize.get_next_autoregressive_input(0,...)
+continue normal AR sampling from scale[1]
+```
+
 ## 2. 推理时的数据流
 
 `autoregressive_infer_cfg` 的循环骨架：

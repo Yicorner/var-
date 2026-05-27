@@ -8,6 +8,7 @@ from .quant import ContinuousMultiScaleQuantizer, VectorQuantizer2
 from .SRVAR import SRVAR
 from .vqvae import VQVAE
 from .lr_vae import LR_VAE
+from .stage3_scale0 import Stage3Scale0Encoder
 from utils import arg_util
 
 
@@ -63,6 +64,8 @@ def build_vae_srvar(
         continuous_head_type=getattr(args, 'continuous_head_type', 'diffloss'),
         scale_loss_weighting=getattr(args, 'scale_loss_weighting', 'token'),
         scale0_query_source=getattr(args, 'scale0_query_source', 'sos'),
+        scale0_start_source=getattr(args, 'scale0_start_source', 'transformer'),
+        stage3_context_mode=getattr(args, 'stage3_context_mode', 'both'),
         # ---- LR conditioning source ----
         lr_cond_source=getattr(args, 'lr_cond_source', 'srvar_encoder'),
     )

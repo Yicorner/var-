@@ -119,6 +119,8 @@ class SRVAR(nn.Module):
         continuous_head_type: str = 'diffloss',
         scale_loss_weighting: str = 'token',
         scale0_query_source: str = 'sos',
+        scale0_start_source: str = 'transformer',
+        stage3_context_mode: str = 'both',
         # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
         lr_cond_source: str = 'srvar_encoder',
     ):
@@ -222,7 +224,7 @@ class SRVAR(nn.Module):
             in_channels=getattr(vae_local, 'img_channels', 3), ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )
-        if self.lr_cond_source == 'srvar_encoder':
+        if self.lr_cond_source == 'srvar_encoder' and not self.stage3_uses_cross_attn:
             self.encoder = Encoder(double_z=False, **ddconfig)
             self.quant_conv = torch.nn.Conv2d(
                 vae_local.Cvae, vae_local.Cvae,
@@ -237,6 +239,8 @@ class SRVAR(nn.Module):
         if use_ref:
             assert self.lr_cond_source == 'srvar_encoder', \
                 'use_ref is only supported with lr_cond_source=srvar_encoder.'
+            assert not self.stage3_uses_cross_attn, \
+                'use_ref is not used when stage3_context_mode=both replaces cross-attn KV.'
             self.encoder_ref = Encoder(double_z=False, **ddconfig)
             self.quant_conv_ref = torch.nn.Conv2d(
                 vae_local.Cvae, vae_local.Cvae,
@@ -254,8 +258,17 @@ class SRVAR(nn.Module):
             f"scale_loss_weighting must be 'token' or 'equal_scale', got {scale_loss_weighting!r}"
         assert scale0_query_source in ('sos', 'low_f_pool'), \
             f"scale0_query_source must be 'sos' or 'low_f_pool', got {scale0_query_source!r}"
+        assert scale0_start_source in ('transformer', 'stage3'), \
+            f"scale0_start_source must be 'transformer' or 'stage3', got {scale0_start_source!r}"
+        assert stage3_context_mode in ('both', 'prefix_only'), \
+            f"stage3_context_mode must be 'both' or 'prefix_only', got {stage3_context_mode!r}"
         self.scale_loss_weighting = scale_loss_weighting
         self.scale0_query_source = scale0_query_source
+        self.scale0_start_source = scale0_start_source
+        self.stage3_context_mode = stage3_context_mode
+        self.stage3_uses_cross_attn = (
+            self.scale0_start_source == 'stage3' and self.stage3_context_mode == 'both'
+        )
         self.latest_per_scale_stats: List[Dict[str, float]] = []
 
         self.rng = torch.Generator(device=dist.get_device())
@@ -406,6 +419,8 @@ class SRVAR(nn.Module):
         print(
             f'[srvar config] continuous_head_type={self.continuous_head_type}, '
             f'scale0_query_source={self.scale0_query_source}, '
+            f'scale0_start_source={self.scale0_start_source}, '
+            f'stage3_context_mode={self.stage3_context_mode}, '
             f'scale_loss_weighting={self.scale_loss_weighting}, '
             f'diffloss_batch_mul={self.diffloss_batch_mul}, '
             f'diffloss_sample_clip_denoised={bool(diffloss_sample_clip_denoised)}',
@@ -500,6 +515,42 @@ class SRVAR(nn.Module):
             low_f = torch.cat((low_f, ref_f), dim=1)
         return low_f
 
+    def _flatten_stage3_s0(
+        self,
+        stage3_s0: torch.Tensor,
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> torch.Tensor:
+        """Flatten frozen stage3 `s0_pred` to `[B, first_l, Cvae]` tokens."""
+        assert stage3_s0 is not None, 'scale0_start_source=stage3 requires `stage3_s0`.'
+        assert stage3_s0.dim() == 4, f'expected stage3_s0 [B,C,h,w], got {stage3_s0.shape}'
+        B, C, H, W = stage3_s0.shape
+        pn_t, pn_h, pn_w = scale_schedule[0]
+        assert pn_t == 1, f'stage3 scale0 expects image scale[0], got {scale_schedule[0]}'
+        assert (H, W) == (pn_h, pn_w), (
+            f'stage3_s0 spatial {H}x{W} != scale[0] {pn_h}x{pn_w}; '
+            f'check --stage3_latent_size and --patch_nums.'
+        )
+        assert C == self.d_vae, f'stage3_s0 channels {C} != VAE token dim {self.d_vae}'
+        first_l = int(pn_t * pn_h * pn_w)
+        assert first_l == self.first_l, (
+            f'first scale token count {first_l} != model first_l={self.first_l}; '
+            f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
+        )
+        return stage3_s0.reshape(B, C, -1).transpose(1, 2).contiguous()
+
+    def _select_condition_low_f(
+        self,
+        inp_B3HW_low: Optional[torch.Tensor],
+        ref_B3HW: Optional[torch.Tensor],
+        low_f_override: Optional[torch.Tensor],
+        stage3_s0: Optional[torch.Tensor],
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> torch.Tensor:
+        """Choose cross-attn KV tokens for the active scale0-start mode."""
+        if self.stage3_uses_cross_attn:
+            return self._flatten_stage3_s0(stage3_s0, scale_schedule)
+        return self._encode_lr_to_low_f(inp_B3HW_low, ref_B3HW, low_f_override)
+
     def _build_scale0_queries(
         self,
         sos: torch.Tensor,
@@ -542,6 +593,19 @@ class SRVAR(nn.Module):
         pooled = F.adaptive_avg_pool2d(source_BChw, output_size=(pn_h, pn_w))
         pooled_BLC = pooled.flatten(2).transpose(1, 2).contiguous()
         return global_sos + self.low_proj_for_scale0(pooled_BLC) + pos
+
+    def _build_stage3_scale0_prefix(
+        self,
+        stage3_s0: torch.Tensor,
+        scale_schedule: List[Tuple[int, int, int]],
+    ) -> torch.Tensor:
+        """Project frozen stage3 `s0_pred` as observed scale[0] self-attn prefix."""
+        stage3_BLC = self._flatten_stage3_s0(stage3_s0, scale_schedule)
+        B, first_l, _ = stage3_BLC.shape
+        assert first_l == self.pos_start.shape[1], (
+            f'stage3 prefix length {first_l} != pos_start length {self.pos_start.shape[1]}'
+        )
+        return self.word_embed(self.norm0_ve(stage3_BLC)) + self.pos_start.expand(B, first_l, -1)
     
     def get_scale_logits(self,
                    si,
@@ -579,6 +643,7 @@ class SRVAR(nn.Module):
         inp_B3HW_low: Optional[torch.Tensor] = None,
         ref_B3HW: Optional[torch.Tensor] = None,
         low_f_override: Optional[torch.Tensor] = None,
+        stage3_s0: Optional[torch.Tensor] = None,
         B: int = 1,
         g_seed: Optional[int] = None,
         ret_img: bool = False,
@@ -607,9 +672,12 @@ class SRVAR(nn.Module):
         # ---- 1. LR conditioning ----
         device = (
             inp_B3HW_low.device if inp_B3HW_low is not None
-            else low_f_override.device
+            else low_f_override.device if low_f_override is not None
+            else stage3_s0.device
         )
-        low_f = self._encode_lr_to_low_f(inp_B3HW_low, ref_B3HW, low_f_override)
+        low_f = self._select_condition_low_f(
+            inp_B3HW_low, ref_B3HW, low_f_override, stage3_s0, scale_schedule
+        )
         lowLen = low_f.shape[1]
         lens = torch.full((B,), lowLen, dtype=torch.int32, device=device)
         max_seqlen_k = lens.max()
@@ -633,7 +701,11 @@ class SRVAR(nn.Module):
             f'first scale token count {first_l} != model first_l={self.first_l}; '
             f'check raw_scale_schedule={self.raw_scale_schedule} vs scale_schedule={scale_schedule}'
         )
-        last_stage = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
+        stage3_mode = self.scale0_start_source == 'stage3'
+        if stage3_mode:
+            last_stage = self._build_stage3_scale0_prefix(stage3_s0, scale_schedule)
+        else:
+            last_stage = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
         accu_BChw = sos.new_zeros(B, vae.Cvae, self.raw_scale_schedule[-1], self.raw_scale_schedule[-1])
         num_stages_minus_1 = len(scale_schedule) - 1
         need_to_pad = 0
@@ -644,7 +716,31 @@ class SRVAR(nn.Module):
             (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
 
         try:
-            for si, pn in enumerate(scale_schedule):
+            start_si = 0
+            if stage3_mode:
+                s0 = stage3_s0.contiguous()
+                ret.append(s0)
+                if trunk_scale <= 1 or num_stages_minus_1 == 0:
+                    accu_BChw, _ = vae.quantize.get_next_autoregressive_input(
+                        0, len(self.raw_scale_schedule), accu_BChw, s0,
+                    )
+                else:
+                    # Warm self-attn KV cache with the observed stage3 s0 prefix,
+                    # then ignore transformer output for scale[0].
+                    _ = self.get_scale_logits(
+                        si=0, last_stage=last_stage, cond_BD_or_gss=cond_BD_or_gss,
+                        ca_kv=ca_kv, scale_schedule=scale_schedule,
+                        B=B, need_to_pad=need_to_pad, attn_fn=attn_fn, cache_now=True,
+                    )
+                    accu_BChw, last_stage_fhat = vae.quantize.get_next_autoregressive_input(
+                        0, len(self.raw_scale_schedule), accu_BChw, s0,
+                    )
+                    last_stage = last_stage_fhat.view(B, vae.Cvae, -1).transpose(1, 2)
+                    last_stage = self.word_embed(self.norm0_ve(last_stage))
+                start_si = 1
+
+            for si in range(start_si, len(scale_schedule)):
+                pn = scale_schedule[si]
                 if si >= trunk_scale:
                     break
                 pn_t, pn_h, pn_w = pn
@@ -721,6 +817,7 @@ class SRVAR(nn.Module):
         scale_schedule: List[Tuple[int, int, int]],
         ref_B3HW: Optional[torch.Tensor] = None,
         low_f_override: Optional[torch.Tensor] = None,
+        stage3_s0: Optional[torch.Tensor] = None,
         cfg_infer: bool = False,
         scale0_loss_mask: bool = False,
     ) -> torch.Tensor:
@@ -738,6 +835,8 @@ class SRVAR(nn.Module):
             ref_B3HW:       optional reference image (use_ref=True only).
             low_f_override: `[B, low_len, C]` raw LR tokens; required when
                             `lr_cond_source='lr_vae'`, ignored otherwise.
+            stage3_s0:      frozen stage3 LR->scale[0] latent used when
+                            `scale0_start_source='stage3'`.
             cfg_infer:      if True, disable training-time CFG dropout (used by infer).
             scale0_loss_mask: if True, drop scale[0] tokens from the DiffLoss target/z.
 
@@ -746,6 +845,8 @@ class SRVAR(nn.Module):
         """
         # ---- sanity ----
         SN = len(scale_schedule)
+        if self.scale0_start_source == 'stage3':
+            scale0_loss_mask = True
         assert len(ms_h_target) == SN, \
             f'len(ms_h_target)={len(ms_h_target)} != len(scale_schedule)={SN}'
         if ms_x_input is not None:
@@ -757,7 +858,9 @@ class SRVAR(nn.Module):
 
         # ---- 1. LR conditioning ----
         with torch.amp.autocast('cuda', enabled=False):
-            low_f = self._encode_lr_to_low_f(inp_B3HW_low, ref_B3HW, low_f_override)
+            low_f = self._select_condition_low_f(
+                inp_B3HW_low, ref_B3HW, low_f_override, stage3_s0, scale_schedule
+            )
             lowLen = low_f.shape[1]
             assert lowLen <= self.cfg_uncond.shape[0], \
                 f'low_len={lowLen} exceeds cfg_uncond buffer length={self.cfg_uncond.shape[0]}; ' \
@@ -805,7 +908,10 @@ class SRVAR(nn.Module):
                     f'ms_x_input=None but scale_schedule has {expected_ms_x_l} '
                     f'teacher-forcing tokens after scale[0].'
                 )
-            sos = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
+            if self.scale0_start_source == 'stage3':
+                sos = self._build_stage3_scale0_prefix(stage3_s0, scale_schedule)
+            else:
+                sos = self._build_scale0_queries(sos, low_f_BLC, scale_schedule)
             if ms_x_input is not None:
                 x_BLC = torch.cat(
                     (sos, self.word_embed(self.norm0_ve(ms_x_input))), dim=1
@@ -1079,6 +1185,9 @@ class SRVAR(nn.Module):
         """Copy encoder/quant_conv weights from the frozen HR VAE into SRVAR's own
         encoder. No-op when `lr_cond_source='lr_vae'` (we don't have a local encoder).
         """
+        if self.stage3_uses_cross_attn:
+            print("[init_LREncoder] skipped (stage3_context_mode=both uses stage3_s0 as cross-attn KV).")
+            return
         if self.lr_cond_source != 'srvar_encoder':
             print(f"[init_LREncoder] skipped (lr_cond_source={self.lr_cond_source}).")
             return
