@@ -64,7 +64,6 @@ class ContinuousMultiScaleQuantizer(nn.Module):
     def __init__(
         self, Cvae, beta: float = 1.0,                # beta is kl_weight; kept named beta for compat
         default_qresi_counts=0, v_patch_nums=None, quant_resi=0.5, share_quant_resi=4,
-        debug_kl_count_limit: int = 0,                # 0 -> never print debug info inside var
         vocab_size=None,                              # kept for cli/ckpt compat, unused
         using_znorm=None,                             # kept for cli/ckpt compat, unused
     ):
@@ -72,8 +71,6 @@ class ContinuousMultiScaleQuantizer(nn.Module):
         self.Cvae: int = Cvae
         self.v_patch_nums: Tuple[int] = tuple(v_patch_nums)
         self.kl_weight: float = beta
-        self.debug_kl_count_limit: int = debug_kl_count_limit
-        self._debug_kl_count = 0
 
         # quant_resi blocks (residual refinement after upsampling), identical to myvaex.
         self.quant_resi_ratio = quant_resi

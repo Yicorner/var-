@@ -41,7 +41,6 @@ class VQVAE(nn.Module):
         default_qresi_counts: int = 0,
         v_patch_nums: Sequence[int] = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         test_mode: bool = True,
-        debug_kl_count_limit: int = 0,
         img_channels: int = 3,
     ):
         super().__init__()
@@ -71,7 +70,6 @@ class VQVAE(nn.Module):
             Cvae=self.Cvae, beta=beta,
             default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums,
             quant_resi=quant_resi, share_quant_resi=share_quant_resi,
-            debug_kl_count_limit=debug_kl_count_limit,
         )
         self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks // 2)
         self.post_quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks // 2)

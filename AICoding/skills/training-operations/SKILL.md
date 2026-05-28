@@ -248,9 +248,8 @@ path plus a stage3 self-attn prefix.
 
 1. 启动期 assert：`patch_nums` 与 stage2 ckpt 一致、`low_len` 与 `tlen` 兼容、`lr_cond_source` 与 `lr_folder` / `stage1_ckpt` 兼容；核对 `[auto_resume]` 日志是否从预期的 `--resume` 或 `BED` 路径加载。
 2. 看启动日志：`[diffloss init]` 的 final layer norm 应为 0 或接近 0；`scale0_query_source` / `scale_loss_weighting` 应符合本次实验预期。
-3. 看 `[KL Debug]` 风格的日志（连续 VAE 内部）：mean/logvar 是否漂移。
-4. 看 `loss` 是不是 NaN：DiffLoss 内 `learn_sigma` 在不稳定时可能出 inf；首先检查 `target` 是否冻结、形状是否一致。
-5. 先看 `VAE_oracle`：如果 oracle 都很差，优先查 stage2 VAE ckpt / `patch_nums` / `vae_ch`。
-6. 再看 `AR_scale0_only`：如果 scale0-only 已经是噪声，优先查 scale[0] 起点、SOS expansion、Plan A(stage1 LR_VAE)。
-7. 最后看 `AR_full`：如果 scale0-only 还行但 full AR 崩，优先查后续 scale teacher forcing / `get_next_autoregressive_input` / DiffLoss sampling。
-8. eval 期间 `autoregressive_infer_cfg` 比训练慢一个量级（每 token 100 步 DDPM），用 `eval_ar_max_batches` 控成本。
+3. 看 `loss` 是不是 NaN：DiffLoss 内 `learn_sigma` 在不稳定时可能出 inf；首先检查 `target` 是否冻结、形状是否一致。
+4. 先看 `VAE_oracle`：如果 oracle 都很差，优先查 stage2 VAE ckpt / `patch_nums` / `vae_ch`。
+5. 再看 `AR_scale0_only`：如果 scale0-only 已经是噪声，优先查 scale[0] 起点、SOS expansion、Plan A(stage1 LR_VAE)。
+6. 最后看 `AR_full`：如果 scale0-only 还行但 full AR 崩，优先查后续 scale teacher forcing / `get_next_autoregressive_input` / DiffLoss sampling。
+7. eval 期间 `autoregressive_infer_cfg` 比训练慢一个量级（每 token 100 步 DDPM），用 `eval_ar_max_batches` 控成本。
