@@ -20,7 +20,7 @@ from utils.misc import auto_resume
 import math
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from models import SRVAR, Stage3Scale0Encoder, VQVAE, build_vae_srvar, build_lr_vae, LR_VAE
+from models import Stage3Scale0Encoder, VQVAE, build_vae_srvar, build_lr_vae, LR_VAE
 from SRtrainer import SRVARTrainer
 from utils.amp_sc import AmpOptimizer
 from utils.lr_control import filter_params
@@ -169,7 +169,8 @@ def build_everything(args: arg_util.Args):
     )
     del dataset_train
     
-    [print(line) for line in auto_resume_info]
+    for line in auto_resume_info:
+        print(line)
     print(f'[dataloader multi processing] ...', end='', flush=True)
     stt = time.time()
     iters_train = len(ld_train)
