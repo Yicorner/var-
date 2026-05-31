@@ -1,0 +1,70 @@
+# BUAA SRVAR stage3 scale0-start training.
+# Run from this repository with 3 GPUs; this is a direct torchrun command
+# and does not call SRtrain.sh.
+
+cd /media/why/Raid524T/QBH/work/var
+
+export CUDA_VISIBLE_DEVICES=0,2,3
+
+BED=local_output/srvar_stage3_s0_patch8to16_gray_mse_3gpu_ep5
+mkdir -p "$BED"
+
+torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=13339 SRtrain.py \
+  --exp_name=srvar_stage3_s0_patch8to16_gray_mse_3gpu_ep5 \
+  --exp_note="gray SRVAR stage3 scale0 start; patch_nums=8,10,13,16; mse head; 3gpu ep5" \
+  --local_out_dir_path="$BED" \
+  --data_path=/media/why/Raid524T/QBH/data/brats_256_t2_2021_pair_png_with_ref \
+  --lr_folder=LR \
+  --hr_folder=HR \
+  --same_shape=False \
+  --img_channels=1 \
+  --patch_nums 8 10 13 16 \
+  --vae_ckpt=/media/why/Raid524T/QBH/work/myvaex/local_output/stage2_gray_scale0_img_align_lr256_patch4to16_no_kl_3gpu_align_weight_5/ckpt-best.pth \
+  --Ct5=32 \
+  --vae_ch=128 \
+  --quant_resi=0.5 \
+  --share_quant_resi=4 \
+  --scale0_start_source=stage3 \
+  --stage3_ckpt=/media/why/Raid524T/QBH/work/myvaex/local_output/stage3_gray_lr256_to_stage2_scale0_patch8_3gpu_align_weight_5/ckpt-best.pth \
+  --stage3_context_mode=both \
+  --stage3_latent_size=8 \
+  --lr_cond_source=srvar_encoder \
+  --continuous_head_type=mse \
+  --scale_loss_weighting=equal_scale \
+  --scale0_query_source=sos \
+  --tlen=1024 \
+  --pn=1M \
+  --rope2d_normalized_by_hw=2 \
+  --rope2d_each_sa_layer=1 \
+  --enable_checkpointing=full-block \
+  --block_chunks=4 \
+  --bs=24 \
+  --ac=1 \
+  --ep=5 \
+  --tblr=6e-4 \
+  --twd=0.005 \
+  --wp=0.1 \
+  --wpe=0.3 \
+  --tclip=2.0 \
+  --fp16=1 \
+  --tini=-1 \
+  --cfg=0.0 \
+  --cfg_infer=1.0 \
+  --workers=4 \
+  --val_and_saving_per_ep=1 \
+  --save_reconstruction_images=True \
+  --reconstruction_save_interval=0 \
+  --reconstruction_max_samples=4 \
+  --reconstruction_dir_name=reconstruction_stage3_s0 \
+  --eval_ar_max_batches=2 \
+  --train_log_points_per_epoch=8 \
+  --diagnostics_enabled=True \
+  --diagnostics_interval=0 \
+  --diagnostics_dir_name=diagnostics \
+  --diagnostics_max_samples=4 \
+  --diagnostics_sample_scale0=True \
+  --diagnostics_multiscale=True \
+  --auto_resume=True \
+  --resume="" \
+  --use_ref=False \
+  --dbg_nan=True 2>&1 | tee -a "$BED/train.log"
