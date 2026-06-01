@@ -219,6 +219,16 @@ class SRVAR(nn.Module):
             f"lr_cond_source must be 'srvar_encoder' or 'lr_vae', got {lr_cond_source!r}"
         self.lr_cond_source: str = lr_cond_source
 
+        assert scale0_start_source in ('transformer', 'stage3'), \
+            f"scale0_start_source must be 'transformer' or 'stage3', got {scale0_start_source!r}"
+        assert stage3_context_mode in ('both', 'prefix_only'), \
+            f"stage3_context_mode must be 'both' or 'prefix_only', got {stage3_context_mode!r}"
+        self.scale0_start_source = scale0_start_source
+        self.stage3_context_mode = stage3_context_mode
+        self.stage3_uses_cross_attn = (
+            self.scale0_start_source == 'stage3' and self.stage3_context_mode == 'both'
+        )
+
         ddconfig = dict(
             dropout=vae_local.dropout, ch=vae_local.ch, z_channels=vae_local.Cvae,
             in_channels=getattr(vae_local, 'img_channels', 3), ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
@@ -258,17 +268,8 @@ class SRVAR(nn.Module):
             f"scale_loss_weighting must be 'token' or 'equal_scale', got {scale_loss_weighting!r}"
         assert scale0_query_source in ('sos', 'low_f_pool'), \
             f"scale0_query_source must be 'sos' or 'low_f_pool', got {scale0_query_source!r}"
-        assert scale0_start_source in ('transformer', 'stage3'), \
-            f"scale0_start_source must be 'transformer' or 'stage3', got {scale0_start_source!r}"
-        assert stage3_context_mode in ('both', 'prefix_only'), \
-            f"stage3_context_mode must be 'both' or 'prefix_only', got {stage3_context_mode!r}"
         self.scale_loss_weighting = scale_loss_weighting
         self.scale0_query_source = scale0_query_source
-        self.scale0_start_source = scale0_start_source
-        self.stage3_context_mode = stage3_context_mode
-        self.stage3_uses_cross_attn = (
-            self.scale0_start_source == 'stage3' and self.stage3_context_mode == 'both'
-        )
         self.latest_per_scale_stats: List[Dict[str, float]] = []
 
         self.rng = torch.Generator(device=dist.get_device())
@@ -300,7 +301,11 @@ class SRVAR(nn.Module):
             nn.GELU(approximate='tanh'),
             nn.Linear(self.D, self.D),
         )
-        self.low_proj_for_scale0 = nn.Linear(self.low_channel, self.D)
+        # Only used when transformer predicts scale[0] with low_f_pool queries.
+        # stage3 start uses _build_stage3_scale0_prefix; sos uses global SOS only.
+        self.low_proj_for_scale0 = None
+        if self.scale0_start_source == 'transformer' and self.scale0_query_source == 'low_f_pool':
+            self.low_proj_for_scale0 = nn.Linear(self.low_channel, self.D)
         
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C)) #SOS pos embeding
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
@@ -420,6 +425,7 @@ class SRVAR(nn.Module):
             f'[srvar config] continuous_head_type={self.continuous_head_type}, '
             f'scale0_query_source={self.scale0_query_source}, '
             f'scale0_start_source={self.scale0_start_source}, '
+            f'low_proj_for_scale0={"built" if self.low_proj_for_scale0 is not None else "skipped"}, '
             f'stage3_context_mode={self.stage3_context_mode}, '
             f'scale_loss_weighting={self.scale_loss_weighting}, '
             f'diffloss_batch_mul={self.diffloss_batch_mul}, '
@@ -592,6 +598,10 @@ class SRVAR(nn.Module):
         source_BChw = source_BLC.transpose(1, 2).reshape(B, source_BLC.shape[-1], low_side, low_side)
         pooled = F.adaptive_avg_pool2d(source_BChw, output_size=(pn_h, pn_w))
         pooled_BLC = pooled.flatten(2).transpose(1, 2).contiguous()
+        assert self.low_proj_for_scale0 is not None, (
+            'low_proj_for_scale0 is only built for '
+            "scale0_start_source='transformer' and scale0_query_source='low_f_pool'."
+        )
         return global_sos + self.low_proj_for_scale0(pooled_BLC) + pos
 
     def _build_stage3_scale0_prefix(

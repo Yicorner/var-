@@ -23,3 +23,4 @@ ckpt_save/
 local_output/
 local_output_wo_diffloss/
 vae_ch160v4096z32.pth
+cuda_12.6.3_560.35.05_linux.run

@@ -512,6 +512,10 @@ class SRVARTrainer(object):
                 except Exception as e:
                     if dist.is_master():
                         print(f'[train_step] reconstruction/diagnostics skipped: {e}')
+            # Master-only AR sampling can take minutes; other ranks must not start
+            # the next iter (DDP forward) until rank 0 finishes diagnostics.
+            if dist.initialized():
+                dist.barrier()
 
         if (log_event or diag_event) and dist.is_master():
             per_scale_log = self._format_per_scale_latent_stats(

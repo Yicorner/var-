@@ -21,7 +21,7 @@ torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --m
   --patch_nums 8 10 13 16 \
   --vae_ckpt=/media/why/Raid524T/QBH/work/myvaex/local_output/stage2_gray_scale0_img_align_lr256_patch4to16_no_kl_3gpu_align_weight_5/ckpt-best.pth \
   --Ct5=32 \
-  --vae_ch=128 \
+  --vae_ch=160 \
   --quant_resi=0.5 \
   --share_quant_resi=4 \
   --scale0_start_source=stage3 \
