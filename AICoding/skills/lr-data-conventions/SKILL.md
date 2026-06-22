@@ -34,11 +34,12 @@ DATA_PATH/
 
 每个 split 下 LR 子目录名。默认 `LR_64x64`。`PairedImageDataset` 直接拼出 `DATA_PATH/<split>/<lr_folder>` 与 `DATA_PATH/<split>/<hr_folder>` 配对。
 
-### 2.2 `--lr_cond_source` (枚举: `srvar_encoder` | `lr_vae`)
+### 2.2 `--lr_cond_source` (枚举: `srvar_encoder` | `learned_lr_encoder` | `lr_vae`)
 
 控制 `low_f` 来自哪个 encoder：
 
 - `srvar_encoder`：SRVAR 自带 `encoder + quant_conv`（权重通过 `init_LREncoder` 从冻结 HR VAE 复制），跟 SRVAR 一起训练。
+- `learned_lr_encoder`：SRVAR 自带的 dedicated LR encoder。主干仍从冻结 HR VAE 初始化以保持 latent 空间对齐，额外 LR detail branch / fuse conv 零初始化后随 SRVAR 训练，用于给 cross-attn 提供更丰富的 LR 条件。
 - `lr_vae`：直接用 stage1 LR_VAE 的 `encode_to_posterior_mean()`。SRVAR 不构造自己的 encoder。
 
 ### 2.3 `--stage1_ckpt` (路径，可空)
@@ -47,7 +48,7 @@ DATA_PATH/
 非空表示加载 myvaex stage1 LR_VAE：
 
 - 同时 `--lr_cond_source=lr_vae` 时，LR_VAE 既给 cross-attn KV、也给 `scale[0]` 的 prior（覆盖 `ms_h_target[0]`）。
-- 仅在 `--lr_cond_source=srvar_encoder` 时，LR_VAE 只参与 `scale[0]` prior 覆盖，不参与 cross-attn。
+- 在 `--lr_cond_source=srvar_encoder` 或 `learned_lr_encoder` 时，LR_VAE 只参与 `scale[0]` prior 覆盖，不参与 cross-attn。
 
 ---
 
@@ -56,9 +57,12 @@ DATA_PATH/
 | `lr_folder` | `lr_cond_source` | `stage1_ckpt` | low_len | scale[0] 起点 | 行为说明 |
 |---|---|---|---|---|---|
 | `LR_64x64` (默认) | `srvar_encoder` (默认) | 空 | 16 (4×4) | SOS 预测 | **方案 B 默认**：信息最全 + 改动最小 |
+| `LR_64x64` | `learned_lr_encoder` | 空 | 16 (4×4) | SOS 预测 | SRVAR 专用 LR 条件 encoder；比 `srvar_encoder` 多一个可学习细节残差分支 |
 | `LR_64x64` | `lr_vae` | 必填 | 16 (4×4) | LR_VAE mean | **方案 A**：scale[0] 用 LR_VAE 的 4×4 latent 直接作为 prior |
 | `LR_64x64` | `srvar_encoder` | 非空 | 16 (4×4) | LR_VAE mean | 方案 A 的变体：SRVAR encoder 进 KV，LR_VAE 只覆盖 scale[0] target |
+| `LR_64x64` | `learned_lr_encoder` | 非空 | 16 (4×4) | LR_VAE mean | 方案 A 的 learned 变体：learned LR encoder 进 KV，LR_VAE 只覆盖 scale[0] target |
 | `LR` (256) | `srvar_encoder` | 空 | 256 (16×16) | SOS 预测 | **沿用旧 var 行为**：KV 长但信息量与 LR_64x64 相同 |
+| `LR` (256) | `learned_lr_encoder` | 空 | 256 (16×16) | SOS 预测 | 推荐给上采样到 256 的 LR 条件；KV 空间更密，detail branch 可学习 LR 边缘/结构 |
 | `LR` (256) | `lr_vae` | * | * | * | **非法**：LR_VAE 期望 64×64 输入，启动 assert 报错 |
 
 启动时（`SRtrain.py`）严格 assert 上面这张表。
@@ -73,7 +77,7 @@ DATA_PATH/
 - 此时 `patch_nums[0]` 必须等于该边长（默认必须是 4）。
 - 启动时 assert：`assert lr_vae.encode_to_posterior_mean(lr_64).shape[-1] == patch_nums[0]`。
 
-如果只是 `srvar_encoder` 走 KV，没有覆盖 target，`patch_nums[0]` 不受 LR 约束（可以保留 `1` 起步，也可以从 `4` 起步）。SRVAR 会把 SOS 扩展成 `patch_nums[0]^2` 个起始 token；因此 `(4,5,6,8,10,13,16)` 下训练输入长度是 `16 + (L-16) = L`，不会再出现 attention mask 长度与 `ms_x_input` 长度错位。
+如果只是 `srvar_encoder` / `learned_lr_encoder` 走 KV，没有覆盖 target，`patch_nums[0]` 不受 LR 约束（可以保留 `1` 起步，也可以从 `4` 起步）。SRVAR 会把 SOS 扩展成 `patch_nums[0]^2` 个起始 token；因此 `(4,5,6,8,10,13,16)` 下训练输入长度是 `16 + (L-16) = L`，不会再出现 attention mask 长度与 `ms_x_input` 长度错位。
 
 ---
 
@@ -98,6 +102,13 @@ LR_FOLDER=LR_64x64 LR_COND_SOURCE=srvar_encoder bash SRtrain.sh
 # 沿用旧 var 行为 (LR_256 + srvar_encoder)
 LR_FOLDER=LR LR_COND_SOURCE=srvar_encoder bash SRtrain.sh
 
+# LR_256 + learned_lr_encoder: 训练专用 LR 条件 encoder
+LR_FOLDER=LR LR_COND_SOURCE=learned_lr_encoder bash SRtrain.sh
+
+# stage3 只给 scale0 prefix，cross-attn 使用 learned LR encoder
+LR_FOLDER=LR SCALE0_START_SOURCE=stage3 STAGE3_CONTEXT_MODE=prefix_only \
+  LR_COND_SOURCE=learned_lr_encoder bash SRtrain.sh
+
 # 方案 A (stage1 LR_VAE 接 cross-attn 与 scale[0] prior)
 LR_FOLDER=LR_64x64 LR_COND_SOURCE=lr_vae \
   STAGE1_CKPT=/path/to/stage1.pth \
@@ -114,3 +125,4 @@ LR_FOLDER=LR_64x64 LR_COND_SOURCE=lr_vae \
 2. `PATCH_NUMS_STR` 与 stage1 / stage2 ckpt 不一致时，要么 VAE 重建会乱，要么 LR_VAE 输出尺寸对不齐 → 启动期都会 assert。
 3. `same_shape=True`（旧 var 默认）会把 LR_64 强制 bicubic 拉到 256；新版必须 `same_shape=False`，让 LR 原样进入 LR_VAE 或 SRVAR encoder。
 4. 数据增广翻转 / center_crop_arr 要在 `(lr, hr)` 上同步执行，crop 区域在 HR 尺度上 sample 后按比例换算到 LR。
+5. `stage3_context_mode=both` 会让 cross-attn KV 直接来自 `stage3_s0`，此时 `learned_lr_encoder` 不会参与；要启用 learned LR KV 必须用 `prefix_only`。

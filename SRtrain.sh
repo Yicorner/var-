@@ -42,6 +42,7 @@ SHARE_QUANT_RESI=${SHARE_QUANT_RESI:-${share_quant_resi:-4}}
 # -------- Stage1 (optional) --------
 STAGE1_CKPT=${STAGE1_CKPT:-${stage1_ckpt:-""}}
 LR_COND_SOURCE=${LR_COND_SOURCE:-${lr_cond_source:-srvar_encoder}}
+LEARNED_LR_ENCODER_WIDTH=${LEARNED_LR_ENCODER_WIDTH:-${learned_lr_encoder_width:-128}}
 SKIP_SCALE0_LOSS=${SKIP_SCALE0_LOSS:-${skip_scale0_loss:-False}}
 
 # -------- Stage3 LR -> scale0 start (optional) --------
@@ -60,6 +61,13 @@ WP=${WP:-${wp:-0}}
 GRAD_CLIP=${GRAD_CLIP:-${tclip:-2.0}}
 FP16=${FP16:-${fp16:-1}}
 TLEN=${TLEN:-${tlen:-1024}}
+
+# -------- transformer capacity --------
+GPT_EMBED_DIM=${GPT_EMBED_DIM:-${gpt_embed_dim:-1024}}
+GPT_DEPTH=${GPT_DEPTH:-${gpt_depth:-16}}
+GPT_NUM_HEADS=${GPT_NUM_HEADS:-${gpt_num_heads:-16}}
+GPT_MLP_RATIO=${GPT_MLP_RATIO:-${gpt_mlp_ratio:-4.0}}
+BLOCK_CHUNKS=${BLOCK_CHUNKS:-${block_chunks:-4}}
 
 # -------- DiffLoss head --------
 DIFFLOSS_W=${DIFFLOSS_W:-${diffloss_w:-1024}}
@@ -102,8 +110,8 @@ if [ -n "$STAGE1_CKPT" ]; then
     --skip_scale0_loss="$SKIP_SCALE0_LOSS"
   )
 else
-  # When stage1 is off, still allow toggling lr_cond_source (must remain
-  # 'srvar_encoder' when STAGE1_CKPT is empty; the trainer asserts this).
+  # When stage1 is off, still allow toggling lr_cond_source among trainable
+  # SRVAR-side encoders.
   STAGE1_ARGS+=(--lr_cond_source="$LR_COND_SOURCE")
 fi
 
@@ -123,9 +131,15 @@ torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 \
   --stage3_ckpt="$STAGE3_CKPT" \
   --stage3_context_mode="$STAGE3_CONTEXT_MODE" \
   --stage3_latent_size="$STAGE3_LATENT_SIZE" \
+  --learned_lr_encoder_width="$LEARNED_LR_ENCODER_WIDTH" \
   --tlen="$TLEN" \
   --pn="1M" --rope2d_normalized_by_hw=2 --rope2d_each_sa_layer=1 \
   --enable_checkpointing="full-block" \
+  --block_chunks="$BLOCK_CHUNKS" \
+  --gpt_embed_dim="$GPT_EMBED_DIM" \
+  --gpt_depth="$GPT_DEPTH" \
+  --gpt_num_heads="$GPT_NUM_HEADS" \
+  --gpt_mlp_ratio="$GPT_MLP_RATIO" \
   --bs="$BS" --ac="$AC" --ep="$EP" --tblr="$LR" --twd="$WD" --wp="$WP" --tclip="$GRAD_CLIP" \
   --fp16="$FP16" --tini=-1 \
   --val_and_saving_per_ep="$VAL_AND_SAVING_PER_EP" \

@@ -35,13 +35,28 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `scale_loss_weighting` | `token` | `token` 或 `equal_scale`；后者让各 scale 平均贡献接近一致 |
 | `scale0_query_source` | `sos` | `sos` 或 `low_f_pool`；后者用 LR token 池化成 scale[0] query |
 
-### 1.3 LR 路径
+### 1.3 Transformer 容量
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `gpt_embed_dim` | 1024 | SRVAR transformer hidden dimension；需能被 head 数整除 |
+| `gpt_depth` | 16 | CrossAttnBlock 层数；需能被 `block_chunks` 整除 |
+| `gpt_num_heads` | 16 | attention head 数；legacy 参数 `hd > 0` 会覆盖它 |
+| `gpt_mlp_ratio` | 4.0 | FFN hidden 宽度倍数；增加 FFN 容量时优先调它 |
+| `block_chunks` | 4 | checkpoint/chunk 分组数；必须整除 `gpt_depth` |
+
+推荐试验顺序：先 `gpt_mlp_ratio=5/6`，再 `gpt_depth=20/24`，最后再增加
+`gpt_embed_dim`。改 depth / hidden / heads 后不要直接完整 resume 旧结构 ckpt；
+需要新 BED 从头训练，或额外实现 partial warm-start。
+
+### 1.4 LR 路径
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `lr_folder` | `LR_64x64` | LR 子目录名 |
 | `hr_folder` | `HR` | HR 子目录名 |
-| `lr_cond_source` | `srvar_encoder` | `srvar_encoder` 或 `lr_vae` |
+| `lr_cond_source` | `srvar_encoder` | `srvar_encoder`、`learned_lr_encoder` 或 `lr_vae` |
+| `learned_lr_encoder_width` | 128 | `learned_lr_encoder` 的 LR detail branch 基础宽度 |
 | `stage1_ckpt` | `""` | 非空时构造 LR_VAE 并加载 |
 | `skip_scale0_loss` | False | 启用 stage1 时是否跳过 scale[0] 的 DiffLoss |
 | `scale0_start_source` | `transformer` | `transformer` keeps old scale0 prediction path; `stage3` uses frozen myvaex stage3 `s0_pred` |
@@ -50,14 +65,19 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `stage3_latent_size` | `4` | must equal `patch_nums[0]` and stage3 checkpoint latent size |
 | `tlen` | 1024 | `cfg_uncond` 长度，需 `≥ low_len` |
 
-### 1.4 CFG
+`learned_lr_encoder` 是 SRVAR 自带的 trainable LR encoder：VAE 对齐主干从冻结
+stage2 VAE 初始化，额外 LR detail branch / fuse conv 零初始化后随 SRVAR 训练。
+若 `scale0_start_source=stage3`，要让它进入 cross-attn KV，必须设置
+`stage3_context_mode=prefix_only`；`both` 会让 KV 直接来自 `stage3_s0`。
+
+### 1.5 CFG
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `cond_drop_rate` | 0.1 | 训练 CFG dropout |
 | `cfg_infer` | 1.0 | 推理 CFG scale |
 
-### 1.5 重建可视化与评估
+### 1.6 重建可视化与评估
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -74,7 +94,7 @@ description: Collect var/ training parameters, SRtrain.sh shell-vars, log iterat
 | `diagnostics_sample_scale0` | True | 是否额外只采样 scale[0] 并 decode |
 | `diagnostics_multiscale` | True | save `ep*_multiscale.png`: LR | s0 | s1 | ... | HR |
 
-### 1.6 Resume / BED / auto_resume
+### 1.7 Resume / BED / auto_resume
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -113,6 +133,18 @@ BED=local_output/my_run AUTO_RESUME=True bash SRtrain.sh
 AUTO_RESUME=False RESUME= bash SRtrain.sh
 ```
 
+容量 / condition 示例：
+
+```bash
+# 增加 FFN 宽度和层数；depth=24 时 block_chunks 可用 4/6/8/12
+GPT_MLP_RATIO=6.0 GPT_DEPTH=24 BLOCK_CHUNKS=4 bash SRtrain.sh
+
+# stage3 只负责 scale0 prefix，cross-attn 使用 learned LR encoder
+SCALE0_START_SOURCE=stage3 STAGE3_CONTEXT_MODE=prefix_only \
+LR_COND_SOURCE=learned_lr_encoder LEARNED_LR_ENCODER_WIDTH=128 \
+bash SRtrain.sh
+```
+
 **易错**：多行 `VAR=val \` 命令若某行末尾缺 `\`，后续变量不会传给 `bash SRtrain.sh`；`BED=...` 行后建议也加 `\`。启动后核对日志里 `data_path`、`lr_folder`、`resume`、`local_out_dir_path` 是否与预期一致。
 
 ---
@@ -128,8 +160,9 @@ AUTO_RESUME=False RESUME= bash SRtrain.sh
 | 数据 | `DATA_PATH` / `LR_FOLDER` / `HR_FOLDER` / `IMG_CHANNELS` | 必填 / `LR_64x64` / `HR` / `3` |
 | 多尺度 | `PATCH_NUMS_STR` | `"1 2 3 4 5 6 8 10 13 16"`（**必须**与 ckpt 一致） |
 | VAE | `VAE_CKPT` / `CVAE` / `VAE_CH` / `QUANT_RESI` / `SHARE_QUANT_RESI` | 必填 / 32 / 128 / 0.5 / 4 |
-| stage1 | `STAGE1_CKPT` / `LR_COND_SOURCE` / `SKIP_SCALE0_LOSS` | `""` / `srvar_encoder` / `False` |
+| stage1 / LR condition | `STAGE1_CKPT` / `LR_COND_SOURCE` / `LEARNED_LR_ENCODER_WIDTH` / `SKIP_SCALE0_LOSS` | `""` / `srvar_encoder` / 128 / `False` |
 | 训练 | `EP` / `BS` / `AC` / `LR` / `WD` / `WP` / `GRAD_CLIP` | 50 / 4 / 1 / 3e-4 / 0.05 / 0 / 2.0 |
+| Transformer | `GPT_EMBED_DIM` / `GPT_DEPTH` / `GPT_NUM_HEADS` / `GPT_MLP_RATIO` / `BLOCK_CHUNKS` | 1024 / 16 / 16 / 4.0 / 4 |
 | DiffLoss | `DIFFLOSS_W` / `DIFFLOSS_D` / `DIFF_STEPS` / `DIFFLOSS_BATCH_MUL` / `SCALE_LOSS_WEIGHTING` / `SCALE0_QUERY_SOURCE` | 1024 / 3 / `"100"` / 4 / `token` / `sos` |
 | CFG | `CFG` / `CFG_INFER` | 0.1 / 1.0 |
 | 验证/重建 | `VAL_AND_SAVING_PER_EP` / `RECON_SAVE_INTERVAL` / `RECON_MAX_SAMPLES` / `RECON_DIR_NAME` / `EVAL_AR_MAX_BATCHES` | 2 / 0 / 4 / `reconstruction_samples` / 4 |

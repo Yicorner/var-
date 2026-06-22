@@ -36,6 +36,7 @@ description: Document SRVAR's training/inference data flow, tensor shapes, and t
   low_f = encoder_path(LR)                                # [B, low_len, C]
                                                           # srvar_encoder + LR_256: low_len=256
                                                           # srvar_encoder + LR_64:  low_len=16
+                                                          # learned_lr_encoder follows the same spatial length
                                                           # lr_vae   + LR_64:  low_len=16
   kv_compact = low_norm(low_f.reshape(-1,C))              # [B*low_len, C]
   sos = cond_BD = low_proj_for_sos(kv_compact)            # [B, D]
@@ -77,8 +78,8 @@ ms_x_input segments for s2+ = unchanged HR teacher forcing
 ```
 
 `stage3_context_mode='both'` also uses flattened `stage3_s0` as cross-attn KV,
-so the local SRVAR LR encoder is not built. `prefix_only` keeps the old LR
-cross-attn path and uses stage3 only for the self-attn prefix.
+so the local SRVAR LR encoder / learned LR encoder is not built. `prefix_only`
+keeps the LR cross-attn path and uses stage3 only for the self-attn prefix.
 
 Inference mirrors training:
 
@@ -123,7 +124,8 @@ img = vae.fhat_to_img(accu_BChw)     # [B, img_channels, 256, 256] in [-1, 1]
 
 | 模块 | 文件 | 说明 |
 |---|---|---|
-| `encoder + quant_conv` | `SRVAR.py` 构造，权重通过 `init_LREncoder` 从冻结 VAE 复制 | 仅在 `lr_cond_source='srvar_encoder'` 时存在 |
+| `encoder + quant_conv` | `SRVAR.py` 构造，权重通过 `init_LREncoder` 从冻结 VAE 复制 | 仅在 `lr_cond_source='srvar_encoder'` 且 cross-attn 不被 stage3 替代时存在 |
+| `LearnedLREncoder` | `SRVAR.py` | `lr_cond_source='learned_lr_encoder'` 时使用；VAE 对齐主干从冻结 VAE 初始化，额外 LR detail branch 与 fuse conv 零初始化后一起训练 |
 | `TextAttentivePool` | `SRVAR.py` | 把 `low_f` 池化成单 token cond `[B, D]` |
 | `low_norm` / `low_proj_for_sos` / `low_proj_for_ca` | `SRVAR.py` | 把 `low_f` 分别投到 SOS 与 KV 的 `D` 维 |
 | `word_embed` | `SRVAR.py` | `Linear(C, D)` 把 teacher forcing 输入投到 transformer dim |
@@ -136,7 +138,31 @@ img = vae.fhat_to_img(accu_BChw)     # [B, img_channels, 256, 256] in [-1, 1]
 
 ---
 
-## 4. 已经移除的旧路径（重要：不要回退）
+## 4. Transformer 容量参数
+
+SRVAR backbone 的主结构由以下 CLI 参数控制，默认保持旧模型：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `--gpt_depth` | 16 | CrossAttnBlock 层数；必须能被 `--block_chunks` 整除 |
+| `--gpt_embed_dim` | 1024 | transformer hidden dimension；必须能被 attention heads 整除 |
+| `--gpt_num_heads` | 16 | attention head 数；legacy `--hd > 0` 会覆盖它 |
+| `--gpt_mlp_ratio` | 4.0 | FFN hidden 宽度倍数，FFN 约为 `gpt_embed_dim * gpt_mlp_ratio` |
+
+调大容量时优先级建议：
+
+```text
+先调 gpt_mlp_ratio: 4.0 -> 5.0/6.0
+再调 gpt_depth:     16 -> 20/24（同时设置 block_chunks 能整除）
+最后调 gpt_embed_dim: 1024 -> 1280（同步 num_heads，例如 20）
+```
+
+改变 `gpt_embed_dim` / `gpt_depth` / `gpt_num_heads` 会改变参数形状或层数，
+不能直接完整 resume 旧结构 checkpoint；需要新 BED 从头跑，或实现专门的 partial warm-start。
+
+---
+
+## 5. 已经移除的旧路径（重要：不要回退）
 
 - `self.head: Linear(D, vocab_size)` 与 CrossEntropyLoss。
 - `vae.quantize.embedding(idx)` / `gumbel_softmax_with_rng` / `sample_with_top_k_top_p_` / beam search。
@@ -145,10 +171,11 @@ img = vae.fhat_to_img(accu_BChw)     # [B, img_channels, 256, 256] in [-1, 1]
 
 ---
 
-## 5. 约束
+## 6. 约束
 
 1. `patch_nums` 与 myvaex stage2 ckpt 严格一致；同时 `vae_ch=128/160`、`Cvae=32`、`quant_resi=0.5`、`share_quant_resi=4` 都要按 ckpt 设。
 2. `scale_schedule[i] = (t, h, w)`，对 1:1 图像通常 `t=1, h=w=patch_nums[i]`。
 3. `low_len` 与 `cfg_uncond` 的 `tlen` 必须 `≥ low_f.shape[1]`。
 4. 训练时 `vae.eval() + requires_grad_(False)`；`lr_vae` 同样要求；构造时 assert。
 5. DiffLoss 训练用 `train_diffusion`（默认 1000 步），推理用 `gen_diffusion`（默认 `--diff_steps=100`）。
+6. `stage3_context_mode='both'` 会让 cross-attn KV 来自 `stage3_s0`，此时任何 `lr_cond_source` 都不会影响 KV；想让 `learned_lr_encoder` 参与 cross-attn 必须使用 `--stage3_context_mode=prefix_only`。

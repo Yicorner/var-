@@ -94,6 +94,7 @@ class SRVARTrainer(object):
 
         assert self.scale0_start_source in ('transformer', 'stage3')
         assert self.stage3_context_mode in ('both', 'prefix_only')
+        assert self.lr_cond_source in ('srvar_encoder', 'learned_lr_encoder', 'lr_vae')
         if self.scale0_start_source == 'stage3':
             assert self.stage3_encoder is not None, 'scale0_start_source=stage3 requires stage3_encoder.'
         if self.stage3_encoder is not None:
@@ -695,6 +696,11 @@ class SRVARTrainer(object):
             'diffloss_batch_mul': self.diffloss_batch_mul,
             'scale0_query_source': getattr(self.srvar_wo_ddp, 'scale0_query_source', 'sos'),
             'scale_loss_weighting': getattr(self.srvar_wo_ddp, 'scale_loss_weighting', 'token'),
+            'gpt_embed_dim': getattr(self.srvar_wo_ddp, 'C', None),
+            'gpt_depth': getattr(self.srvar_wo_ddp, 'depth', None),
+            'gpt_num_heads': getattr(self.srvar_wo_ddp, 'num_heads', None),
+            'gpt_mlp_ratio': getattr(self.srvar_wo_ddp, 'mlp_ratio', None),
+            'learned_lr_encoder_width': getattr(self.srvar_wo_ddp, 'learned_lr_encoder_width', None),
         }
 
     def state_dict(self):

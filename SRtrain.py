@@ -114,13 +114,34 @@ def build_everything(args: arg_util.Args):
     print(f'initial args:\n{str(args)}')
 
     assert args.vae_ckpt, '--vae_ckpt must be provided (myvaex stage2 ckpt path).'
+    assert args.lr_cond_source in ('srvar_encoder', 'learned_lr_encoder', 'lr_vae'), \
+        f"--lr_cond_source must be 'srvar_encoder', 'learned_lr_encoder', or 'lr_vae', got {args.lr_cond_source!r}"
     assert args.scale0_start_source in ('transformer', 'stage3'), \
         f"--scale0_start_source must be 'transformer' or 'stage3', got {args.scale0_start_source!r}"
     assert args.stage3_context_mode in ('both', 'prefix_only'), \
         f"--stage3_context_mode must be 'both' or 'prefix_only', got {args.stage3_context_mode!r}"
+    gpt_num_heads = args.hd if args.hd > 0 else args.gpt_num_heads
+    assert args.gpt_embed_dim % gpt_num_heads == 0, (
+        f'--gpt_embed_dim={args.gpt_embed_dim} must be divisible by '
+        f'num_heads={gpt_num_heads} (--gpt_num_heads, or legacy --hd when set).'
+    )
+    assert args.block_chunks >= 1, f'--block_chunks must be >= 1, got {args.block_chunks}.'
+    assert args.gpt_depth % args.block_chunks == 0, (
+        f'--gpt_depth={args.gpt_depth} must be divisible by --block_chunks={args.block_chunks}.'
+    )
     args.stage3_latent_size = int(args.stage3_latent_size)
     if args.scale0_start_source == 'stage3':
         assert args.stage3_ckpt, '--stage3_ckpt is required when --scale0_start_source=stage3.'
+    if (
+        args.lr_cond_source == 'learned_lr_encoder'
+        and args.scale0_start_source == 'stage3'
+        and args.stage3_context_mode == 'both'
+    ):
+        print(
+            '[lr_cond_source] learned_lr_encoder is ignored when '
+            'scale0_start_source=stage3 and stage3_context_mode=both; '
+            'use --stage3_context_mode=prefix_only to feed learned LR tokens to cross-attn.'
+        )
     vae_ckpt_blob = torch.load(args.vae_ckpt, map_location='cpu')
     ckpt_img_channels = int(_read_ckpt_arg(vae_ckpt_blob, 'img_channels', args.img_channels))
     if ckpt_img_channels != int(args.img_channels):

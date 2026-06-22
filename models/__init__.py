@@ -33,6 +33,10 @@ def build_vae_srvar(
 
     srvar_kw = dict(
         low_channel=args.Ct5, low_len=args.tlen,
+        embed_dim=getattr(args, 'gpt_embed_dim', 1024),
+        depth=getattr(args, 'gpt_depth', 16),
+        num_heads=getattr(args, 'gpt_num_heads', 16),
+        mlp_ratio=getattr(args, 'gpt_mlp_ratio', 4.0),
         norm_eps=args.norm_eps, rms_norm=args.rms,
         shared_aln=args.saln, head_aln=args.haln,
         cond_drop_rate=args.cfg, rand_uncond=args.rand_uncond, drop_rate=args.drop,
@@ -68,6 +72,7 @@ def build_vae_srvar(
         stage3_context_mode=getattr(args, 'stage3_context_mode', 'both'),
         # ---- LR conditioning source ----
         lr_cond_source=getattr(args, 'lr_cond_source', 'srvar_encoder'),
+        learned_lr_encoder_width=getattr(args, 'learned_lr_encoder_width', 128),
     )
     if args.dp >= 0:
         srvar_kw['drop_path_rate'] = args.dp

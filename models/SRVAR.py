@@ -50,6 +50,94 @@ class TextAttentivePool(nn.Module):
     def forward(self, ca_kv): 
         return self.ca(None, ca_kv).squeeze(1)
 
+
+def _valid_group_count(channels: int) -> int:
+    for groups in (32, 16, 8, 4, 2, 1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class ConvNormAct(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+            nn.GroupNorm(_valid_group_count(out_channels), out_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class LearnedLRDetailBranch(nn.Module):
+    """A lightweight LR-specific residual branch aligned to the VAE latent grid."""
+
+    def __init__(self, in_channels: int, out_channels: int, width: int = 128):
+        super().__init__()
+        width = int(max(width, out_channels))
+        self.net = nn.Sequential(
+            ConvNormAct(in_channels, width, stride=1),
+            ConvNormAct(width, width, stride=2),
+            ConvNormAct(width, width, stride=2),
+            ConvNormAct(width, width * 2, stride=2),
+            ConvNormAct(width * 2, width * 2, stride=2),
+            nn.Conv2d(width * 2, out_channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        detail = self.net(x)
+        if detail.shape[-2:] != target_hw:
+            detail = F.interpolate(detail, size=target_hw, mode='bilinear', align_corners=False)
+        return detail
+
+    def reset_output_to_zero(self):
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+
+class LearnedLREncoder(nn.Module):
+    """Trainable LR encoder with VAE-aligned latent output plus a detail residual."""
+
+    def __init__(self, ddconfig: dict, quant_conv_ks: int, detail_width: int = 128):
+        super().__init__()
+        self.encoder = Encoder(double_z=False, **ddconfig)
+        self.quant_conv = nn.Conv2d(
+            ddconfig['z_channels'], ddconfig['z_channels'],
+            quant_conv_ks, stride=1, padding=quant_conv_ks // 2,
+        )
+        self.detail_branch = LearnedLRDetailBranch(
+            in_channels=ddconfig['in_channels'],
+            out_channels=ddconfig['z_channels'],
+            width=detail_width,
+        )
+        self.fuse = nn.Sequential(
+            nn.GroupNorm(_valid_group_count(ddconfig['z_channels']), ddconfig['z_channels']),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(ddconfig['z_channels'], ddconfig['z_channels'], kernel_size=3, padding=1),
+        )
+        nn.init.zeros_(self.fuse[-1].weight)
+        nn.init.zeros_(self.fuse[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.quant_conv(self.encoder(x))
+        detail = self.detail_branch(x, base.shape[-2:])
+        mixed = base + detail
+        return mixed + self.fuse(mixed)
+
+    def init_from_vae(self, vae_local: VQVAE):
+        self.encoder.load_state_dict(vae_local.encoder.state_dict())
+        self.quant_conv.load_state_dict(vae_local.quant_conv.state_dict())
+        self.reset_residual_to_zero()
+
+    def reset_residual_to_zero(self):
+        self.detail_branch.reset_output_to_zero()
+        nn.init.zeros_(self.fuse[-1].weight)
+        nn.init.zeros_(self.fuse[-1].bias)
+
 class SharedAdaLin(nn.Linear):
     def forward(self, cond_BD):
         C = self.weight.shape[0] // 6
@@ -121,8 +209,9 @@ class SRVAR(nn.Module):
         scale0_query_source: str = 'sos',
         scale0_start_source: str = 'transformer',
         stage3_context_mode: str = 'both',
-        # ---- LR condition source: 'srvar_encoder' (default) or 'lr_vae' ----
+        # ---- LR condition source: srvar_encoder / learned_lr_encoder / lr_vae ----
         lr_cond_source: str = 'srvar_encoder',
+        learned_lr_encoder_width: int = 128,
     ):
         
         # set hyperparameters
@@ -142,6 +231,7 @@ class SRVAR(nn.Module):
         self.num_heads = num_heads
         self.batch_size = batch_size
         self.mlp_ratio = mlp_ratio
+        self.learned_lr_encoder_width = int(learned_lr_encoder_width)
         self.cond_drop_rate = cond_drop_rate
         self.norm_eps = norm_eps
         self.prog_si = -1
@@ -211,12 +301,14 @@ class SRVAR(nn.Module):
         
         super().__init__()
 
+        assert embed_dim % num_heads == 0, \
+            f'embed_dim={embed_dim} must be divisible by num_heads={num_heads}'
         # LR conditioning source. When 'srvar_encoder' we own the encoder/quant_conv
-        # (initialised from the frozen HR VAE via init_LREncoder). When 'lr_vae' the
-        # caller is responsible for running the (frozen) LR_VAE upstream and passing
-        # `low_f` directly into forward()/autoregressive_infer_cfg().
-        assert lr_cond_source in ('srvar_encoder', 'lr_vae'), \
-            f"lr_cond_source must be 'srvar_encoder' or 'lr_vae', got {lr_cond_source!r}"
+        # (initialised from the frozen HR VAE via init_LREncoder). When
+        # 'learned_lr_encoder' we use a dedicated VAE-aligned encoder plus a trainable
+        # detail branch. When 'lr_vae' the caller passes `low_f` from frozen LR_VAE.
+        assert lr_cond_source in ('srvar_encoder', 'learned_lr_encoder', 'lr_vae'), \
+            f"lr_cond_source must be 'srvar_encoder', 'learned_lr_encoder', or 'lr_vae', got {lr_cond_source!r}"
         self.lr_cond_source: str = lr_cond_source
 
         assert scale0_start_source in ('transformer', 'stage3'), \
@@ -234,11 +326,20 @@ class SRVAR(nn.Module):
             in_channels=getattr(vae_local, 'img_channels', 3), ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )
+        self.learned_lr_encoder = None
         if self.lr_cond_source == 'srvar_encoder' and not self.stage3_uses_cross_attn:
             self.encoder = Encoder(double_z=False, **ddconfig)
             self.quant_conv = torch.nn.Conv2d(
                 vae_local.Cvae, vae_local.Cvae,
                 vae_local.quant_conv_ks, stride=1, padding=vae_local.quant_conv_ks // 2,
+            )
+        elif self.lr_cond_source == 'learned_lr_encoder' and not self.stage3_uses_cross_attn:
+            self.encoder = None
+            self.quant_conv = None
+            self.learned_lr_encoder = LearnedLREncoder(
+                ddconfig=ddconfig,
+                quant_conv_ks=vae_local.quant_conv_ks,
+                detail_width=self.learned_lr_encoder_width,
             )
         else:
             # Skip building the local encoder; LR_VAE is fed in externally.
@@ -392,10 +493,11 @@ class SRVAR(nn.Module):
         if self.continuous_head_type == 'mse':
             self.direct_head = nn.Linear(self.C, vae_local.Cvae)
         
-        self.num_block_chunks = block_chunks or 1
-        self.num_blocks_in_a_chunk = depth // block_chunks
-        print(f"{self.num_blocks_in_a_chunk=}, {depth=}, {block_chunks=}")
-        assert self.num_blocks_in_a_chunk * block_chunks == depth
+        self.num_block_chunks = int(block_chunks or 1)
+        assert self.num_block_chunks >= 1, f'block_chunks must be >= 1, got {block_chunks}'
+        self.num_blocks_in_a_chunk = depth // self.num_block_chunks
+        print(f"{self.num_blocks_in_a_chunk=}, {depth=}, block_chunks={self.num_block_chunks}")
+        assert self.num_blocks_in_a_chunk * self.num_block_chunks == depth
         if self.num_block_chunks == 1:
             self.blocks = nn.ModuleList(self.unregistered_blocks)
         else:
@@ -427,6 +529,8 @@ class SRVAR(nn.Module):
             f'scale0_start_source={self.scale0_start_source}, '
             f'low_proj_for_scale0={"built" if self.low_proj_for_scale0 is not None else "skipped"}, '
             f'stage3_context_mode={self.stage3_context_mode}, '
+            f'lr_cond_source={self.lr_cond_source}, '
+            f'learned_lr_encoder_width={self.learned_lr_encoder_width}, '
             f'scale_loss_weighting={self.scale_loss_weighting}, '
             f'diffloss_batch_mul={self.diffloss_batch_mul}, '
             f'diffloss_sample_clip_denoised={bool(diffloss_sample_clip_denoised)}',
@@ -499,6 +603,8 @@ class SRVAR(nn.Module):
         """Produce the `low_f` token sequence `[B, low_len, Cvae]` from LR input.
 
         - With `lr_cond_source='srvar_encoder'`, run SRVAR's local encoder/quant_conv.
+        - With `lr_cond_source='learned_lr_encoder'`, run the dedicated LR encoder
+          with a trainable detail residual branch.
         - With `lr_cond_source='lr_vae'`, the caller must pass `low_f_override`
           (already `[B, low_len, Cvae]`, e.g. flattened `lr_vae.encode_to_posterior_mean(LR)`).
         Optionally concat a reference image's tokens (only with srvar_encoder).
@@ -509,6 +615,13 @@ class SRVAR(nn.Module):
             assert low_f_override.dim() == 3, \
                 f'expected low_f_override [B,L,C], got {low_f_override.shape}'
             return low_f_override
+
+        if self.lr_cond_source == 'learned_lr_encoder':
+            assert self.learned_lr_encoder is not None
+            B = inp_B3HW_low.shape[0]
+            low_f = self.learned_lr_encoder(inp_B3HW_low)
+            low_f = low_f.permute(0, 2, 3, 1).reshape(B, -1, low_f.shape[1])
+            return low_f
 
         assert self.encoder is not None and self.quant_conv is not None
         B = inp_B3HW_low.shape[0]
@@ -1193,10 +1306,16 @@ class SRVAR(nn.Module):
     
     def init_LREncoder(self, vae_local: VQVAE):
         """Copy encoder/quant_conv weights from the frozen HR VAE into SRVAR's own
-        encoder. No-op when `lr_cond_source='lr_vae'` (we don't have a local encoder).
+        encoder. `learned_lr_encoder` also copies the VAE-aligned trunk, while its
+        residual detail branch remains zero-initialized and fully trainable.
         """
         if self.stage3_uses_cross_attn:
             print("[init_LREncoder] skipped (stage3_context_mode=both uses stage3_s0 as cross-attn KV).")
+            return
+        if self.lr_cond_source == 'learned_lr_encoder':
+            assert self.learned_lr_encoder is not None
+            self.learned_lr_encoder.init_from_vae(vae_local)
+            print("[init_LREncoder] learned_lr_encoder trunk initialized from frozen VAE; detail branch remains trainable.")
             return
         if self.lr_cond_source != 'srvar_encoder':
             print(f"[init_LREncoder] skipped (lr_cond_source={self.lr_cond_source}).")

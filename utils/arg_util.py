@@ -42,7 +42,8 @@ class Args(Tap):
     lr_folder: str = 'LR_64x64'         # subdir under DATA_PATH/{train,val} for LR images
     hr_folder: str = 'HR'               # subdir under DATA_PATH/{train,val} for HR images
     img_channels: int = 3               # raw image/model channels; set 1 for grayscale medical image checkpoints
-    lr_cond_source: str = 'srvar_encoder'  # 'srvar_encoder' or 'lr_vae'
+    lr_cond_source: str = 'srvar_encoder'  # 'srvar_encoder', 'learned_lr_encoder', or 'lr_vae'
+    learned_lr_encoder_width: int = 128    # width of the trainable LR detail branch
     stage1_ckpt: str = ''               # non-empty -> build & load LR_VAE
     skip_scale0_loss: bool = False      # plan-A only: drop scale[0] from DiffLoss target/z
     scale0_start_source: str = 'transformer'  # 'transformer' or 'stage3'
@@ -98,6 +99,10 @@ class Args(Tap):
     
     # GPT
     block_chunks: int = 4
+    gpt_embed_dim: int = 1024              # transformer hidden dimension
+    gpt_depth: int = 16                    # transformer layer count
+    gpt_num_heads: int = 16                # transformer attention head count
+    gpt_mlp_ratio: float = 4.0             # FFN hidden width multiplier
 
     tfast: int = 0                      # compile GPT
     rms: bool = False
